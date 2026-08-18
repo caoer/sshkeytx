@@ -85,11 +85,11 @@ func TestRemoveByMaterialAndFingerprint(t *testing.T) {
 func TestAddDedupes(t *testing.T) {
 	k1, l1 := genKey(t)
 	f := Parse([]byte(l1 + " existing@comment\n"))
-	if f.Add(k1, "dup") {
+	if f.Add(k1, "dup", nil) {
 		t.Fatal("added a duplicate key")
 	}
 	k2, _ := genKey(t)
-	if !f.Add(k2, "fresh@host") {
+	if !f.Add(k2, "fresh@host", nil) {
 		t.Fatal("failed to add a fresh key")
 	}
 	out := string(f.Render())
@@ -100,16 +100,16 @@ func TestAddDedupes(t *testing.T) {
 
 func TestParseKeySpec(t *testing.T) {
 	k, line := genKey(t)
-	m, comment, err := ParseKeySpec(line + " who@where")
+	m, comment, _, err := ParseKeySpec(line + " who@where")
 	if err != nil || m.Key == nil || comment != "who@where" {
 		t.Fatalf("literal spec: m=%v comment=%q err=%v", m, comment, err)
 	}
 	fp := Fingerprint(k)
-	m, _, err = ParseKeySpec(fp)
+	m, _, _, err = ParseKeySpec(fp)
 	if err != nil || m.FingerprintSHA256 != fp {
 		t.Fatalf("fingerprint spec: %v err=%v", m, err)
 	}
-	if _, _, err := ParseKeySpec("not a key"); err == nil {
+	if _, _, _, err := ParseKeySpec("not a key"); err == nil {
 		t.Fatal("garbage spec accepted")
 	}
 }

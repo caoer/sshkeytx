@@ -4,11 +4,11 @@ import "testing"
 
 func TestQuote(t *testing.T) {
 	cases := map[string]string{
-		"plain":        "'plain'",
-		"with space":   "'with space'",
-		"it's":         `'it'\''s'`,
-		"a`b$(x)\\":    "'a`b$(x)\\'",
-		"":             "''",
+		"plain":      "'plain'",
+		"with space": "'with space'",
+		"it's":       `'it'\''s'`,
+		"a`b$(x)\\":  "'a`b$(x)\\'",
+		"":           "''",
 	}
 	for in, want := range cases {
 		if got := Quote(in); got != want {

@@ -88,6 +88,7 @@ type userSpec struct {
 	matcher authkeys.Matcher
 	key     ssh.PublicKey
 	comment string
+	options []string
 }
 
 // parseUserSpec accepts user=VALUE where VALUE is a .pub file path, a
@@ -109,11 +110,11 @@ func parseUserSpec(arg string) (userSpec, error) {
 		}
 		value = strings.TrimSpace(string(data))
 	}
-	m, comment, err := authkeys.ParseKeySpec(value)
+	m, comment, options, err := authkeys.ParseKeySpec(value)
 	if err != nil {
 		return userSpec{}, fmt.Errorf("spec %q: %w", arg, err)
 	}
-	us.matcher, us.key, us.comment = m, m.Key, comment
+	us.matcher, us.key, us.comment, us.options = m, m.Key, comment, options
 	return us, nil
 }
 
@@ -232,7 +233,7 @@ func applyCmd(rf *rootFlags) *cobra.Command {
 				return err
 			}
 			for _, us := range rSpecs {
-				ops = append(ops, tx.Op{User: us.user, Action: tx.ActionRemove, Spec: us.spec, Matcher: us.matcher, Key: us.key, Comment: us.comment})
+				ops = append(ops, tx.Op{User: us.user, Action: tx.ActionRemove, Spec: us.spec, Matcher: us.matcher, Key: us.key, Comment: us.comment, Options: us.options})
 			}
 			aSpecs, err := parseUserSpecs(adds)
 			if err != nil {
@@ -242,7 +243,7 @@ func applyCmd(rf *rootFlags) *cobra.Command {
 				if us.key == nil {
 					return fmt.Errorf("--add %s=%s: additions need the full public key, not a fingerprint", us.user, us.spec)
 				}
-				ops = append(ops, tx.Op{User: us.user, Action: tx.ActionAdd, Spec: us.spec, Matcher: us.matcher, Key: us.key, Comment: us.comment})
+				ops = append(ops, tx.Op{User: us.user, Action: tx.ActionAdd, Spec: us.spec, Matcher: us.matcher, Key: us.key, Comment: us.comment, Options: us.options})
 			}
 			hostKey, err := rf.hostKey()
 			if err != nil {
@@ -430,6 +431,7 @@ func probeCmd(rf *rootFlags) *cobra.Command {
 
 func restoreCmd(rf *rootFlags) *cobra.Command {
 	var from string
+	var forceHost, dryRun bool
 	cmd := &cobra.Command{
 		Use:   "restore --from <local-backup-dir>",
 		Short: "Break-glass: re-apply a transaction's local pre-transaction backups to the host",
@@ -448,6 +450,36 @@ func restoreCmd(rf *rootFlags) *cobra.Command {
 			m, err := tx.ParseMeta(metaRaw)
 			if err != nil {
 				return err
+			}
+			// Restoring host A's backup onto host B overwrites B's keys with
+			// A's and deletes any file A did not have — a lockout from one
+			// tab-completion mistake, on the path reached for when things are
+			// already broken.
+			if m.Target != "" && m.Target != target.String() && !forceHost {
+				return fmt.Errorf("backup %s was taken from %s but --target is %s; "+
+					"pass --force-different-host to restore across hosts",
+					from, m.Target, target.String())
+			}
+			// meta.json is a file on disk; on the break-glass path it may
+			// have come from somewhere the operator does not fully trust.
+			// Its values reach a root shell.
+			for _, f := range m.Files {
+				if !remote.ValidUsername(f.User) {
+					return fmt.Errorf("meta.json names an invalid user %q — refusing this backup", f.User)
+				}
+				if !strings.HasPrefix(f.Path, "/") {
+					return fmt.Errorf("meta.json names a non-absolute path %q — refusing this backup", f.Path)
+				}
+			}
+			if dryRun {
+				for _, f := range m.Files {
+					if f.Existed {
+						fmt.Printf("would restore %s (mode %s uid %s) from %s\n", f.Path, f.Mode, f.UID, from)
+					} else {
+						fmt.Printf("would REMOVE %s (absent before that transaction)\n", f.Path)
+					}
+				}
+				return nil
 			}
 			hostKey, err := rf.hostKey()
 			if err != nil {
@@ -478,9 +510,13 @@ func restoreCmd(rf *rootFlags) *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("local backup for %s: %w", f.User, err)
 				}
-				opts := remote.WriteOpts{Mode: f.Mode, MkdirFor: true}
+				// MkdirFor is deliberately not set: restore re-applies files
+				// that existed before, so their directories exist too, and
+				// creating one here would chmod a directory that may be shared
+				// (--path /etc/ssh/authorized_keys.d/%u).
+				opts := remote.WriteOpts{Mode: f.Mode}
 				if uid == "0" {
-					opts.UID, opts.GID = f.UID, f.GID
+					opts.RunAs = f.User
 				}
 				if err := remote.SwapFile(client, f.Path, content, opts); err != nil {
 					return exitError{ExitPreflight, fmt.Errorf("restore %s: %w", f.Path, err)}
@@ -490,7 +526,10 @@ func restoreCmd(rf *rootFlags) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&from, "from", "", "local backup dir written by a previous transaction")
+	rfl := cmd.Flags()
+	rfl.StringVar(&from, "from", "", "local backup dir written by a previous transaction")
+	rfl.BoolVar(&forceHost, "force-different-host", false, "allow restoring a backup onto a host it was not taken from")
+	rfl.BoolVar(&dryRun, "dry-run", false, "print what would be restored or removed; write nothing")
 	return cmd
 }
 

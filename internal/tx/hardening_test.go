@@ -1,0 +1,371 @@
+package tx
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	"golang.org/x/crypto/ssh"
+
+	"github.com/caoer/sshkeytx/internal/authkeys"
+)
+
+// These tests encode failure modes found in review of ece95f8. Each one
+// describes a way the transaction can lock an operator out of a host, or
+// hand a local user root, while reporting success.
+
+// TestSymlinkedTargetIsRefused: authorized_keys is a symlink (config
+// management, dotfile repos, home-manager). `stat` does not dereference, so
+// the swap copies the SYMLINK's mode — 0777 on Linux, 0755 on BSD — onto a
+// regular file that replaces the link. sshd's StrictModes then refuses the
+// file and every key is rejected. The abort path re-applies the same mode, so
+// the tool's own recovery cannot undo the lockout it just created.
+//
+// Operating on a symlinked target must be refused before anything is written.
+func TestSymlinkedTargetIsRefused(t *testing.T) {
+	h := newHarness(t)
+	guardSigner, _, guardLine := newKey(t)
+	_, newPub, _ := newKey(t)
+
+	real := filepath.Join(h.sandbox, "real-authorized_keys")
+	if err := os.WriteFile(real, []byte(guardLine+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	linked := h.srv.KeysPath(h.user)
+	if err := os.MkdirAll(filepath.Dir(linked), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, linked); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := h.config(guardSigner, []Op{
+		{User: h.user, Action: ActionAdd, Spec: "new", Matcher: authkeys.Matcher{Key: newPub}, Key: newPub},
+	})
+	res := Run(cfg)
+
+	if res.Outcome == OutcomeCommitted {
+		t.Errorf("committed against a symlinked authorized_keys; want refusal")
+	}
+	fi, err := os.Lstat(linked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("symlink was replaced by a regular file mode %#o (sshd StrictModes would refuse it)", fi.Mode().Perm())
+	}
+	if got, _ := os.ReadFile(real); !bytes.Equal(got, []byte(guardLine+"\n")) {
+		t.Errorf("content behind the symlink was modified: %q", got)
+	}
+}
+
+// TestPlantedTempSymlinkIsNotFollowed: SwapFile writes to a fixed, predictable
+// temp path inside the target user's own ~/.ssh. A local user can plant a
+// symlink there in advance; the root-run `cat >` then follows it and writes
+// attacker-chosen content wherever it points (and `chown` follows too).
+//
+// The write must fail rather than follow a pre-existing path.
+func TestPlantedTempSymlinkIsNotFollowed(t *testing.T) {
+	h := newHarness(t)
+	guardSigner, _, guardLine := newKey(t)
+	_, newPub, _ := newKey(t)
+	if err := h.srv.WriteKeys(h.user, guardLine); err != nil {
+		t.Fatal(err)
+	}
+
+	outside := filepath.Join(h.sandbox, "outside-the-transaction")
+	const sentinel = "UNTOUCHED\n"
+	if err := os.WriteFile(outside, []byte(sentinel), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	planted := h.srv.KeysPath(h.user) + ".sshkeytx.tmp"
+	if err := os.Symlink(outside, planted); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := h.config(guardSigner, []Op{
+		{User: h.user, Action: ActionAdd, Spec: "new", Matcher: authkeys.Matcher{Key: newPub}, Key: newPub},
+	})
+	_ = Run(cfg)
+
+	got, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != sentinel {
+		t.Errorf("write followed the planted symlink and clobbered a file outside the transaction:\n%q", got)
+	}
+}
+
+// TestSymlinkedParentDirIsNotChmodded: when the target file does not exist,
+// SwapFile runs `mkdir -p DIR && chmod 700 DIR && chown UID:GID DIR`. mkdir -p
+// succeeds through a symlink-to-directory, so chmod/chown land on the real
+// directory. As root that hands an unprivileged user any directory they can
+// point .ssh at.
+func TestSymlinkedParentDirIsNotChmodded(t *testing.T) {
+	h := newHarness(t)
+	guardSigner, _, guardLine := newKey(t)
+	_, newPub, _ := newKey(t)
+	if err := h.srv.WriteKeys(h.user, guardLine); err != nil {
+		t.Fatal(err)
+	}
+
+	victim := filepath.Join(h.sandbox, "victim-dir")
+	if err := os.MkdirAll(victim, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkedDir := filepath.Join(h.sandbox, "shadow-home", ".ssh")
+	if err := os.MkdirAll(filepath.Dir(linkedDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, linkedDir); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := h.config(guardSigner, []Op{
+		{User: h.user, Action: ActionAdd, Spec: "new", Matcher: authkeys.Matcher{Key: newPub}, Key: newPub},
+	})
+	cfg.PathTemplate = filepath.Join(h.sandbox, "shadow-home", ".ssh", "authorized_keys")
+	_ = Run(cfg)
+
+	fi, err := os.Stat(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o755 {
+		t.Errorf("chmod followed the symlinked .ssh and changed the real directory to %#o", fi.Mode().Perm())
+	}
+}
+
+// TestRemoveOnlyEmptyingFileIsRefused: `--remove <your only key>` empties
+// authorized_keys, proves on a fresh connection that you are now refused,
+// disarms the trap, deletes the remote backups, and reports committed. The
+// tool verifies the negative rigorously and never verifies that anyone can
+// still get in.
+func TestRemoveOnlyEmptyingFileIsRefused(t *testing.T) {
+	h := newHarness(t)
+	guardSigner, guardPub, guardLine := newKey(t)
+	if err := h.srv.WriteKeys(h.user, guardLine); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := h.config(guardSigner, []Op{
+		{User: h.user, Action: ActionRemove, Spec: "self", Matcher: authkeys.Matcher{Key: guardPub}, Key: guardPub},
+	})
+	res := Run(cfg)
+
+	if res.Outcome == OutcomeCommitted {
+		t.Errorf("committed a transaction that leaves %s with no usable key", h.srv.KeysPath(h.user))
+	}
+	f := mustReadKeys(t, h.srv.KeysPath(h.user))
+	if countKeys(f) == 0 {
+		t.Errorf("authorized_keys left with zero keys — host is unreachable")
+	}
+}
+
+// TestLostExitStatusDoesNotDisarmTrap: `dirty` is set only after SwapFile
+// REPORTS success. When the mutation lands but the exit status is lost
+// (*ssh.ExitMissingError — the remote shell was killed, the channel closed
+// early), abort skips the file as untouched, finds nothing to revert, writes
+// the commit marker — disarming the dead-man trap that was correctly armed for
+// it — and reports "revert complete and verified".
+func TestLostExitStatusDoesNotDisarmTrap(t *testing.T) {
+	h := newHarness(t)
+	guardSigner, _, guardLine := newKey(t)
+	_, newPub, _ := newKey(t)
+	if err := h.srv.WriteKeys(h.user, guardLine); err != nil {
+		t.Fatal(err)
+	}
+	// Lose the exit status of the FIRST swap only. The mv still happens, so
+	// the file really changes; the abort's own revert is left working, which
+	// keeps the scenario deterministic.
+	var mu sync.Mutex
+	firstSwap := true
+	h.srv.DropExitStatusFor = func(raw string) bool {
+		if !strings.Contains(raw, "mv -f") {
+			return false
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if firstSwap {
+			firstSwap = false
+			return true
+		}
+		return false
+	}
+
+	cfg := h.config(guardSigner, []Op{
+		{User: h.user, Action: ActionAdd, Spec: "new", Matcher: authkeys.Matcher{Key: newPub}, Key: newPub},
+	})
+	res := Run(cfg)
+
+	if res.Outcome == OutcomeCommitted {
+		t.Fatalf("expected the lost exit status to fail the transaction, got committed")
+	}
+	// The mutation landed on the remote. Whatever the tool reports, it must
+	// not leave the added key in place: either its own revert removed it, or
+	// it left the trap armed and said the revert was unverified.
+	f := mustReadKeys(t, h.srv.KeysPath(h.user))
+	if len(f.Find(authkeys.Matcher{Key: newPub})) == 0 {
+		return // reverted despite never learning the swap succeeded
+	}
+	if res.Outcome == OutcomeAbortedReverted {
+		t.Errorf("reported %s (revert verified) but the remote file still carries the added key", res.Outcome)
+	}
+	entries, _ := os.ReadDir(filepath.Join(h.sandbox, "tmp"))
+	if len(entries) != 1 {
+		t.Fatalf("expected the tx dir to be kept, got %v", entries)
+	}
+	txdir := filepath.Join(h.sandbox, "tmp", entries[0].Name())
+	if _, err := os.Stat(filepath.Join(txdir, "commit")); err == nil {
+		t.Errorf("abort disarmed the trap (wrote %s/commit) while the file is still mutated — nothing will restore it", txdir)
+	}
+}
+
+// TestRejectionProbeNeedsPositiveControl: a probe rejection proves only that
+// THIS auth attempt failed. When sshd refuses the user wholesale — AllowUsers,
+// DenyUsers, a locked account, PermitRootLogin no — every probe comes back
+// rejected whatever authorized_keys contains. The transaction then commits a
+// revocation it never actually verified.
+func TestRejectionProbeNeedsPositiveControl(t *testing.T) {
+	h := newHarness(t)
+	guardSigner, _, guardLine := newKey(t)
+	_, victimPub, victimLine := newKey(t)
+	if err := h.srv.WriteKeys(h.user, guardLine, victimLine); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := h.config(guardSigner, []Op{
+		{User: h.user, Action: ActionRemove, Spec: "victim", Matcher: authkeys.Matcher{Key: victimPub}, Key: victimPub},
+	})
+	// Start refusing the user only AFTER the guard connection is up, so the
+	// transaction reaches its verification phase — otherwise the test would
+	// pass merely because the guard could not connect.
+	cfg.Log = func(format string, args ...any) {
+		msg := fmt.Sprintf(format, args...)
+		h.t.Log(msg)
+		if strings.Contains(msg, "step 4/6 remove") {
+			h.srv.DenyUsers[h.user] = true
+		}
+	}
+
+	res := Run(cfg)
+	if res.Outcome == OutcomeNothingChanged {
+		t.Fatalf("transaction never reached verification (guard failed): %v", res.Err)
+	}
+	if res.Outcome == OutcomeCommitted {
+		t.Errorf("committed a revocation whose only evidence is a refusal that would have " +
+			"occurred with the key still in place — the probe channel is blind for this user")
+	}
+}
+
+func TestAddPreservesAuthorizedKeysOptions(t *testing.T) {
+	_, pub, _ := newKey(t)
+	line := `command="/usr/bin/rrsync -ro /srv",restrict,no-pty ` +
+		strings.TrimSpace(string(ssh.MarshalAuthorizedKey(pub))) + " backup@nas"
+
+	m, comment, options, err := authkeys.ParseKeySpec(line)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := authkeys.Parse(nil)
+	f.Add(m.Key, comment, options)
+	got := string(f.Render())
+
+	if !strings.Contains(got, "command=") || !strings.Contains(got, "restrict") {
+		t.Errorf("authorized_keys options were dropped — a restricted key installs unrestricted\ngot: %s", got)
+	}
+}
+
+// TestAddAndRemoveSameKeyIsRefused: adding and removing the same key for the
+// same user has no single correct meaning — whichever phase runs last decides
+// the end state, so the request would leave the key present under one phase
+// order and absent under another, with both verification steps "passing" and
+// contradicting each other.
+func TestAddAndRemoveSameKeyIsRefused(t *testing.T) {
+	h := newHarness(t)
+	guardSigner, _, guardLine := newKey(t)
+	_, churnPub, _ := newKey(t)
+	if err := h.srv.WriteKeys(h.user, guardLine); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := h.config(guardSigner, []Op{
+		{User: h.user, Action: ActionAdd, Spec: "k.pub", Matcher: authkeys.Matcher{Key: churnPub}, Key: churnPub},
+		{User: h.user, Action: ActionRemove, Spec: "k.pub", Matcher: authkeys.Matcher{Key: churnPub}, Key: churnPub},
+	})
+	res := Run(cfg)
+	if res.Outcome != OutcomeNothingChanged {
+		t.Fatalf("want refusal before any write, got %s (err=%v)", res.Outcome, res.Err)
+	}
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "both added") {
+		t.Errorf("want a self-cancelling-ops error, got %v", res.Err)
+	}
+
+	// By fingerprint rather than key material — same conflict.
+	cfg2 := h.config(guardSigner, []Op{
+		{User: h.user, Action: ActionAdd, Spec: "k.pub", Matcher: authkeys.Matcher{Key: churnPub}, Key: churnPub},
+		{User: h.user, Action: ActionRemove, Spec: "fp", Matcher: authkeys.Matcher{FingerprintSHA256: authkeys.Fingerprint(churnPub)}},
+	})
+	if res2 := Run(cfg2); res2.Outcome != OutcomeNothingChanged {
+		t.Errorf("fingerprint form: want refusal, got %s", res2.Outcome)
+	}
+
+	// The same key for DIFFERENT users is legitimate and must still be allowed.
+	cfg3 := h.config(guardSigner, []Op{
+		{User: h.user, Action: ActionAdd, Spec: "k.pub", Matcher: authkeys.Matcher{Key: churnPub}, Key: churnPub},
+		{User: "daemon", Action: ActionRemove, Spec: "k.pub", Matcher: authkeys.Matcher{Key: churnPub}, Key: churnPub},
+	})
+	if err := (&T{cfg: cfg3}).rejectSelfCancellingOps(); err != nil {
+		t.Errorf("same key for two different users must be allowed, got: %v", err)
+	}
+}
+
+// TestRotationNeverLeavesTheFileWithoutAWorkingKey pins what the phase order
+// buys: during a rotation of the ONLY key, every intermediate state of the
+// file on disk still contains a key sshd would accept. With removal first the
+// file passes through a state with no usable key, held open only by the guard
+// connection.
+func TestRotationNeverLeavesTheFileWithoutAWorkingKey(t *testing.T) {
+	h := newHarness(t)
+	oldSigner, oldPub, oldLine := newKey(t)
+	newSigner, newPub, _ := newKey(t)
+	if err := h.srv.WriteKeys(h.user, oldLine); err != nil {
+		t.Fatal(err)
+	}
+	keysPath := h.srv.KeysPath(h.user)
+
+	// Sample the file after every remote command the transaction issues.
+	var mu sync.Mutex
+	empty := 0
+	h.srv.DropExitStatusFor = func(string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if content, err := os.ReadFile(keysPath); err == nil && countKeys(authkeys.Parse(content)) == 0 {
+			empty++
+		}
+		return false
+	}
+
+	cfg := h.config(oldSigner, []Op{
+		{User: h.user, Action: ActionAdd, Spec: "new", Matcher: authkeys.Matcher{Key: newPub}, Key: newPub},
+		{User: h.user, Action: ActionRemove, Spec: "old", Matcher: authkeys.Matcher{FingerprintSHA256: authkeys.Fingerprint(oldPub)}},
+	})
+	cfg.VerifySigners = []ssh.Signer{newSigner}
+	res := Run(cfg)
+	if res.Err != nil || res.Outcome != OutcomeCommitted {
+		t.Fatalf("rotation should commit, got %s err=%v", res.Outcome, res.Err)
+	}
+	if empty > 0 {
+		t.Errorf("authorized_keys was observed with zero keys %d time(s) during the rotation", empty)
+	}
+	f := mustReadKeys(t, keysPath)
+	if len(f.Find(authkeys.Matcher{Key: newPub})) != 1 || len(f.Find(authkeys.Matcher{Key: oldPub})) != 0 {
+		t.Errorf("final state wrong: new present=%d old present=%d",
+			len(f.Find(authkeys.Matcher{Key: newPub})), len(f.Find(authkeys.Matcher{Key: oldPub})))
+	}
+}

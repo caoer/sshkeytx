@@ -1,11 +1,12 @@
 // Package tx implements the sshkeytx transaction:
 //
-//	1. connect     — open the guard connection, arm the remote dead-man trap
-//	2. remove keys — CAS: copy authorized_keys to remote + local backup, swap
-//	3. verify      — fresh connection with each removed key must be REJECTED
-//	4. add keys    — CAS again, swap
-//	5. verify      — fresh connection with each added key must be ACCEPTED
-//	6. cleanup     — commit marker, remote tx dir removed, guard released
+//  1. connect     — open the guard connection, arm the remote dead-man trap
+//  2. add keys    — CAS: copy authorized_keys to remote + local backup, swap
+//  3. verify      — fresh connection with each added key must be ACCEPTED
+//  4. remove keys — CAS again, swap
+//  5. verify      — fresh connection with each removed key must be REJECTED,
+//     after a positive control proves the probe can say ACCEPTED
+//  6. cleanup     — prove access, commit marker, tx dir removed, guard released
 //
 // The guard connection from step 1 is held for the whole transaction and
 // every remote command runs through it, so a broken connection can never be
@@ -13,6 +14,23 @@
 // reverting every touched file to its pre-transaction content; if the
 // process or connection dies instead, the remote trap performs the same
 // revert.
+//
+// Additions come first on purpose: a rotation is then never one failure away
+// from a host with no usable key, because the replacement is in place and
+// proven before the old key goes. Removing first bought nothing — the removal
+// is verified at the end either way.
+//
+// Two rules keep the verdicts honest. A rejection is evidence only once some
+// key that IS in the file comes back accepted for the same user — otherwise
+// sshd may be refusing the user outright, and every probe would say the same
+// thing with the key still in place. And nothing commits until a key in the
+// final file is proven to work on a fresh connection, so a transaction cannot
+// verify its way into a lockout.
+//
+// Files belonging to another user are written with that user's own privileges
+// (remote.WriteOpts.RunAs) and symlinked targets are refused outright: a
+// privileged write into a directory its owner controls is the whole of the
+// escalation surface here.
 package tx
 
 import (
@@ -52,6 +70,7 @@ type Op struct {
 	Matcher authkeys.Matcher
 	Key     ssh.PublicKey // full key when the spec carried one (always, for add)
 	Comment string
+	Options []string // authorized_keys restrictions (command=, restrict, from=...)
 }
 
 // Config parameterizes a transaction.
@@ -75,8 +94,8 @@ type Outcome string
 const (
 	OutcomeCommitted        Outcome = "committed"
 	OutcomeDryRun           Outcome = "dry-run"
-	OutcomeAbortedReverted  Outcome = "aborted-reverted"   // failure, revert verified
-	OutcomeRevertUnverified Outcome = "revert-unverified"  // failure, revert NOT verified — trap is the backstop
+	OutcomeAbortedReverted  Outcome = "aborted-reverted"    // failure, revert verified
+	OutcomeRevertUnverified Outcome = "revert-unverified"   // failure, revert NOT verified — trap is the backstop
 	OutcomeNothingChanged   Outcome = "failed-before-write" // failure before any mutation
 )
 
@@ -98,9 +117,13 @@ type userFile struct {
 	orig       []byte          // pre-transaction content
 	origExists bool
 	work       *authkeys.File // working copy being edited
-	dirty      bool           // a swap has been performed on the remote
+	dirty      bool           // a swap was ISSUED for this file (not necessarily confirmed)
 	manifested bool           // trap manifest entry written
-	remoteBak  string
+	// writeUnconfirmed records a swap whose outcome the client never
+	// learned. The file may or may not have changed, so the revert must be
+	// attempted and read back before anything is claimed about it.
+	writeUnconfirmed bool
+	remoteBak        string
 }
 
 type Meta struct {
@@ -201,17 +224,19 @@ func Run(cfg Config) Result {
 		return Result{Outcome: OutcomeDryRun, TxID: t.txid, LocalDir: t.local}
 	}
 
-	// Steps 2–5.
-	if err := t.phaseRemove(); err != nil {
-		return t.abort(err)
-	}
-	if err := t.phaseVerifyRemoved(); err != nil {
-		return t.abort(err)
-	}
+	// Steps 2–5. Additions land and are proven BEFORE anything is removed,
+	// so the host never passes through a state with no key the operator can
+	// use. The end state is identical either way; the window is not.
 	if err := t.phaseAdd(); err != nil {
 		return t.abort(err)
 	}
 	if err := t.phaseVerifyAdded(); err != nil {
+		return t.abort(err)
+	}
+	if err := t.phaseRemove(); err != nil {
+		return t.abort(err)
+	}
+	if err := t.phaseVerifyRemoved(); err != nil {
 		return t.abort(err)
 	}
 
@@ -241,6 +266,34 @@ func (t *T) validate() error {
 			return fmt.Errorf("add for %s: spec %q must be a full public key (a fingerprint cannot be added)", op.User, op.Spec)
 		}
 	}
+	return t.rejectSelfCancellingOps()
+}
+
+// rejectSelfCancellingOps refuses a transaction that both adds and removes the
+// same key for the same user.
+//
+// Such a request has no single correct meaning: whichever phase runs last
+// decides the end state, so the same command leaves the key present under one
+// phase order and absent under another, while both verification steps "pass"
+// and contradict each other. The same key for DIFFERENT users is an ordinary
+// request (grant to alice, revoke from bob) and stays allowed.
+func (t *T) rejectSelfCancellingOps() error {
+	for _, add := range t.cfg.Ops {
+		if add.Action != ActionAdd || add.Key == nil {
+			continue
+		}
+		for _, rm := range t.cfg.Ops {
+			if rm.Action != ActionRemove || rm.User != add.User {
+				continue
+			}
+			if !rm.Matcher.Matches(authkeys.Line{Key: add.Key}) {
+				continue
+			}
+			return fmt.Errorf("refusing: %s is both added (%q) and removed (%q) for %s — "+
+				"the end state would depend on which step ran last; use separate transactions "+
+				"if you really mean to churn this key", authkeys.Fingerprint(add.Key), add.Spec, rm.Spec, add.User)
+		}
+	}
 	return nil
 }
 
@@ -266,7 +319,25 @@ func (t *T) setupLocal() error {
 }
 
 // connect performs step 1: dial, keepalive watchdog, remote tx dir, guard.
-func (t *T) connect() error {
+// Every failure after the dial closes the connection and removes the tx dir:
+// the caller's `defer t.client.Close()` is only registered once connect has
+// succeeded, so without this the socket, the watchdog goroutine and a remote
+// directory all leak for the life of the process.
+func (t *T) connect() (err error) {
+	defer func() {
+		if err == nil {
+			return
+		}
+		if t.guard != nil {
+			_ = t.guard.closeGraceful(5 * time.Second)
+		}
+		if t.client != nil {
+			if t.txdir != "" {
+				_, _ = remote.Run(t.client, "rm -rf "+remote.Quote(t.txdir), nil)
+			}
+			_ = t.client.Close()
+		}
+	}()
 	t.logf("step 1/6 connect: dialing guard connection %s", t.cfg.Target)
 	client, err := sshx.Dial(t.cfg.Target, t.cfg.AuthMethods, t.cfg.HostKey, t.cfg.DialTimeout)
 	if err != nil {
@@ -276,11 +347,26 @@ func (t *T) connect() error {
 
 	// Keepalive watchdog: detects a dead transport fast on our side. The
 	// remote trap covers the other side.
+	//
+	// SendRequest waits for a reply, so on a black-holed connection it
+	// blocks exactly as long as the thing it is meant to detect — the
+	// watchdog has to bound itself or it never fires at all.
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			if _, _, err := client.SendRequest("keepalive@openssh.com", true, nil); err != nil {
+			reply := make(chan error, 1)
+			go func() {
+				_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+				reply <- err
+			}()
+			var err error
+			select {
+			case err = <-reply:
+			case <-time.After(15 * time.Second):
+				err = fmt.Errorf("keepalive unanswered for 15s")
+			}
+			if err != nil {
 				t.connErr = err
 				close(t.connLost)
 				return
@@ -355,6 +441,15 @@ func (t *T) loadFiles() error {
 		info, err := remote.Stat(t.client, path)
 		if err != nil {
 			return err
+		}
+		if info.IsSymlink {
+			// stat does not dereference, so the swap would copy the LINK's
+			// mode (0777 on GNU) onto a regular file replacing it, and sshd
+			// StrictModes would then refuse every key in it. Reverting does
+			// not help: the revert applies the same mode. Refuse up front,
+			// before anything is written.
+			return fmt.Errorf("%s is a symlink (%w) — point --path at the real file, "+
+				"or at the mutable path sshd consults", path, remote.ErrSymlink)
 		}
 		content, exists, err := remote.ReadFile(t.client, path)
 		if err != nil {
@@ -447,24 +542,42 @@ func valueOr(s, alt string) string {
 
 // swap is the "swap" half: atomic replace with ownership/mode preserved
 // (or created 600, owner = target user, for new files).
-func (t *T) swap(uf *userFile) error {
+// writeOpts builds the attribute policy for a write to uf. When the guard is
+// root and the file belongs to someone else, the write drops to that user
+// rather than chowning afterwards — a privileged write into a directory its
+// owner controls is what made a planted symlink worth planting.
+func (t *T) writeOpts(uf *userFile) remote.WriteOpts {
 	opts := remote.WriteOpts{}
 	if uf.info.Exists {
 		opts.Mode = uf.info.Mode
-		if t.rootly {
-			opts.UID, opts.GID = uf.info.UID, uf.info.GID
-		}
 	} else {
 		opts.Mode = "600"
 		opts.MkdirFor = true
-		if t.rootly {
+	}
+	if t.rootly && uf.user != t.cfg.Target.User {
+		opts.RunAs = uf.user
+		return opts
+	}
+	if t.rootly {
+		if uf.info.Exists {
+			opts.UID, opts.GID = uf.info.UID, uf.info.GID
+		} else {
 			opts.UID, opts.GID = uf.uid, uf.gid
 		}
 	}
-	if err := remote.SwapFile(t.client, uf.path, uf.work.Render(), opts); err != nil {
+	return opts
+}
+
+func (t *T) swap(uf *userFile) error {
+	// Mark BEFORE the write, not after. A command whose reply is lost may
+	// still have landed; treating "no confirmation" as "never happened"
+	// makes abort skip the one file that changed. dirty means "a write was
+	// issued", which is the only thing the client actually knows.
+	uf.dirty = true
+	if err := remote.SwapFile(t.client, uf.path, uf.work.Render(), t.writeOpts(uf)); err != nil {
+		uf.writeUnconfirmed = true
 		return fmt.Errorf("swap %s: %w", uf.path, err)
 	}
-	uf.dirty = true
 	return nil
 }
 
@@ -472,7 +585,7 @@ func (t *T) swap(uf *userFile) error {
 func (t *T) phaseRemove() error {
 	removals := t.opsBy(ActionRemove)
 	if len(removals) == 0 {
-		t.logf("step 2/6 remove: no removals requested — skipped")
+		t.logf("step 4/6 remove: no removals requested — skipped")
 		return nil
 	}
 	if err := t.checkHealth("pre-remove"); err != nil {
@@ -489,7 +602,7 @@ func (t *T) phaseRemove() error {
 			op := ops[i]
 			removed := uf.work.Remove(op.Matcher)
 			if len(removed) == 0 {
-				t.logf("step 2/6 remove: %s: %s already absent (idempotent, nothing to do)", u, op.Matcher)
+				t.logf("step 4/6 remove: %s: %s already absent (idempotent, nothing to do)", u, op.Matcher)
 				continue
 			}
 			// Keep the full key for the rejection probe even when the spec
@@ -499,7 +612,7 @@ func (t *T) phaseRemove() error {
 				ops[i] = op
 			}
 			changed = true
-			t.logf("step 2/6 remove: %s: removing %d line(s) matching %s", u, len(removed), op.Matcher)
+			t.logf("step 4/6 remove: %s: removing %d line(s) matching %s", u, len(removed), op.Matcher)
 		}
 		if !changed {
 			continue
@@ -510,7 +623,7 @@ func (t *T) phaseRemove() error {
 		if err := t.swap(uf); err != nil {
 			return err
 		}
-		t.logf("step 2/6 remove: %s swapped (%d keys remain)", uf.path, countKeys(uf.work))
+		t.logf("step 4/6 remove: %s swapped (%d keys remain)", uf.path, countKeys(uf.work))
 	}
 	// write back updated ops (Key enrichment) — opsBy returned copies
 	t.enrichRemovalKeys(removals)
@@ -545,12 +658,41 @@ func (t *T) phaseVerifyRemoved() error {
 		}
 	}
 	if !any {
-		t.logf("step 3/6 verify-removed: no removals — skipped")
+		t.logf("step 5/6 verify-removed: no removals — skipped")
 		return nil
 	}
 	if err := t.checkHealth("pre-verify-removed"); err != nil {
 		return err
 	}
+	// A rejection only means something if this probe channel is capable of
+	// returning an acceptance for the same user. sshd refuses some users
+	// outright — AllowUsers, DenyUsers, a locked account, PermitRootLogin no
+	// — and then every probe comes back rejected whatever the file holds.
+	controlled := map[string]bool{}
+	for _, op := range ops {
+		if op.Action != ActionRemove || controlled[op.User] {
+			continue
+		}
+		controlled[op.User] = true
+		remaining := liveKeys(t.files[op.User].work)
+		if len(remaining) == 0 {
+			t.logf("step 5/6 verify-removed: %s: no keys remain, so no positive control is "+
+				"possible — rejection verdicts below are UNVERIFIED until access is proven before commit", op.User)
+			continue
+		}
+		ok, err := t.someKeyAccepted(op.User, remaining)
+		if err != nil {
+			return fmt.Errorf("verify-removed: positive control for %s: %w", op.User, err)
+		}
+		if !ok {
+			return fmt.Errorf("verify-removed: positive control FAILED for %s: none of the %d key(s) "+
+				"still in %s is accepted, so a rejection proves nothing about the removed key "+
+				"(sshd may refuse this user outright, or read a different AuthorizedKeysFile)",
+				op.User, len(remaining), t.files[op.User].path)
+		}
+		t.logf("step 5/6 verify-removed: %s: positive control ok — the probe channel answers ACCEPTED for a key that is present", op.User)
+	}
+
 	for _, op := range ops {
 		if op.Action != ActionRemove {
 			continue
@@ -561,7 +703,7 @@ func (t *T) phaseVerifyRemoved() error {
 			if len(t.files[op.User].work.Find(op.Matcher)) > 0 {
 				return fmt.Errorf("verify-removed: %s still present in %s", op.Matcher, t.files[op.User].path)
 			}
-			t.logf("step 3/6 verify-removed: %s@%s: %s — content-verified absent (no key material for a live probe)", op.User, t.cfg.Target.Host, op.Matcher)
+			t.logf("step 5/6 verify-removed: %s@%s: %s — content-verified absent (no key material for a live probe)", op.User, t.cfg.Target.Host, op.Matcher)
 			continue
 		}
 		res, err := sshx.ProbeKey(target, op.Key, t.cfg.HostKey, t.cfg.DialTimeout)
@@ -571,7 +713,7 @@ func (t *T) phaseVerifyRemoved() error {
 		if res.Accepted {
 			return fmt.Errorf("verify-removed: %s STILL ACCEPTED for %s — %s", op.Matcher, target, res.Detail)
 		}
-		t.logf("step 3/6 verify-removed: %s: new connection REJECTED ✓ (%s)", op.Matcher, res.Detail)
+		t.logf("step 5/6 verify-removed: %s: new connection REJECTED ✓ (%s)", op.Matcher, res.Detail)
 	}
 	return nil
 }
@@ -580,7 +722,7 @@ func (t *T) phaseVerifyRemoved() error {
 func (t *T) phaseAdd() error {
 	adds := t.opsBy(ActionAdd)
 	if len(adds) == 0 {
-		t.logf("step 4/6 add: no additions requested — skipped")
+		t.logf("step 2/6 add: no additions requested — skipped")
 		return nil
 	}
 	if err := t.checkHealth("pre-add"); err != nil {
@@ -598,11 +740,11 @@ func (t *T) phaseAdd() error {
 		}
 		changed := false
 		for _, op := range ops {
-			if uf.work.Add(op.Key, op.Comment) {
+			if uf.work.Add(op.Key, op.Comment, op.Options) {
 				changed = true
-				t.logf("step 4/6 add: %s: adding %s %s", u, op.Key.Type(), authkeys.Fingerprint(op.Key))
+				t.logf("step 2/6 add: %s: adding %s %s%s", u, op.Key.Type(), authkeys.Fingerprint(op.Key), optionNote(op.Options))
 			} else {
-				t.logf("step 4/6 add: %s: %s already present (idempotent, nothing to do)", u, authkeys.Fingerprint(op.Key))
+				t.logf("step 2/6 add: %s: %s already present (idempotent, nothing to do)", u, authkeys.Fingerprint(op.Key))
 			}
 		}
 		if !changed {
@@ -611,7 +753,7 @@ func (t *T) phaseAdd() error {
 		if err := t.swap(uf); err != nil {
 			return err
 		}
-		t.logf("step 4/6 add: %s swapped (%d keys now)", uf.path, countKeys(uf.work))
+		t.logf("step 2/6 add: %s swapped (%d keys now)", uf.path, countKeys(uf.work))
 	}
 	return nil
 }
@@ -627,7 +769,7 @@ func (t *T) phaseVerifyAdded() error {
 		}
 	}
 	if !any {
-		t.logf("step 5/6 verify-added: no additions — skipped")
+		t.logf("step 3/6 verify-added: no additions — skipped")
 		return nil
 	}
 	if err := t.checkHealth("pre-verify-added"); err != nil {
@@ -647,7 +789,7 @@ func (t *T) phaseVerifyAdded() error {
 			if !res.Accepted {
 				return fmt.Errorf("verify-added: %s NOT accepted for %s — %s", fp, target, res.Detail)
 			}
-			t.logf("step 5/6 verify-added: %s: new connection ACCEPTED ✓ (full auth)", fp)
+			t.logf("step 3/6 verify-added: %s: new connection ACCEPTED ✓ (full auth)", fp)
 			continue
 		}
 		res, err := sshx.ProbeKey(target, op.Key, t.cfg.HostKey, t.cfg.DialTimeout)
@@ -657,7 +799,7 @@ func (t *T) phaseVerifyAdded() error {
 		if !res.Accepted {
 			return fmt.Errorf("verify-added: %s NOT accepted for %s — %s", fp, target, res.Detail)
 		}
-		t.logf("step 5/6 verify-added: %s: new connection ACCEPTED ✓ (%s; supply --verify-identity for full auth)", fp, res.Detail)
+		t.logf("step 3/6 verify-added: %s: new connection ACCEPTED ✓ (%s; supply --verify-identity for full auth)", fp, res.Detail)
 	}
 	return nil
 }
@@ -672,10 +814,76 @@ func matchSigner(signers []ssh.Signer, key ssh.PublicKey) ssh.Signer {
 	return nil
 }
 
-// commit — step 6: disarm the trap (commit marker), release the guard,
-// remove the remote tx dir. Local backups are kept permanently.
+// liveKeys returns the public keys currently in a working copy.
+func liveKeys(f *authkeys.File) []ssh.PublicKey {
+	var out []ssh.PublicKey
+	for _, l := range f.Lines {
+		if l.Key != nil {
+			out = append(out, l.Key)
+		}
+	}
+	return out
+}
+
+// someKeyAccepted probes keys for user on FRESH connections until one is
+// accepted. A connection-level error is returned as an error (it is not a
+// verdict); an all-rejected result is a false verdict, not a failure.
+func (t *T) someKeyAccepted(user string, keys []ssh.PublicKey) (bool, error) {
+	target := t.cfg.Target.WithUser(user)
+	var lastErr error
+	for _, k := range keys {
+		res, err := sshx.ProbeKey(target, k, t.cfg.HostKey, t.cfg.DialTimeout)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if res.Accepted {
+			return true, nil
+		}
+	}
+	if lastErr != nil {
+		return false, lastErr
+	}
+	return false, nil
+}
+
+// proveAccess is the gate the whole tool exists for: before the trap is
+// disarmed and the backups deleted, prove on a FRESH connection that somebody
+// can still get in to every file this transaction touched.
+//
+// Without it, `--remove <your only key>` empties the file, proves on a fresh
+// connection that you are now refused, and reports success.
+func (t *T) proveAccess() error {
+	for _, u := range t.order {
+		uf := t.files[u]
+		if !uf.dirty {
+			continue
+		}
+		keys := liveKeys(uf.work)
+		if len(keys) == 0 {
+			return fmt.Errorf("refusing to commit: %s would be left with no keys — "+
+				"nobody could authenticate as %s afterwards", uf.path, u)
+		}
+		ok, err := t.someKeyAccepted(u, keys)
+		if err != nil {
+			return fmt.Errorf("proving access for %s: %w", u, err)
+		}
+		if !ok {
+			return fmt.Errorf("refusing to commit: none of the %d key(s) left in %s is accepted "+
+				"on a fresh connection — committing would lock %s out", len(keys), uf.path, u)
+		}
+		t.logf("step 6/6 cleanup: access proven for %s — a key in the final file is accepted on a fresh connection ✓", u)
+	}
+	return nil
+}
+
+// commit — step 6: prove access, disarm the trap (commit marker), release the
+// guard, remove the remote tx dir. Local backups are kept permanently.
 func (t *T) commit() error {
 	if err := t.checkHealth("pre-cleanup"); err != nil {
+		return err
+	}
+	if err := t.proveAccess(); err != nil {
 		return err
 	}
 	t.logf("step 6/6 cleanup: writing commit marker (disarms remote trap)")
@@ -719,13 +927,12 @@ func (t *T) abort(cause error) Result {
 		if !uf.dirty {
 			continue
 		}
+		if uf.writeUnconfirmed {
+			t.logf("ABORT: %s had a swap whose outcome was never confirmed — reverting and reading back", uf.path)
+		}
 		var err error
 		if uf.origExists {
-			opts := remote.WriteOpts{Mode: uf.info.Mode}
-			if t.rootly {
-				opts.UID, opts.GID = uf.info.UID, uf.info.GID
-			}
-			err = remote.SwapFile(t.client, uf.path, uf.orig, opts)
+			err = remote.SwapFile(t.client, uf.path, uf.orig, t.writeOpts(uf))
 		} else {
 			err = remote.Remove(t.client, uf.path)
 		}
@@ -747,7 +954,7 @@ func (t *T) abort(cause error) Result {
 			t.logf("ABORT: revert verification of %s FAILED: file should not exist", uf.path)
 			revertFailed = true
 		default:
-			t.logf("ABORT: %s reverted and verified (sha256 %s)", uf.path, shortHash(uf.orig))
+			t.logf("ABORT: %s reverted and verified (sha256 %s)", uf.path, sha256Hex(uf.orig))
 		}
 	}
 
@@ -835,7 +1042,7 @@ func (t *T) finishMeta(outcome Outcome) {
 			mf.UID, mf.GID, mf.Mode = uf.info.UID, uf.info.GID, uf.info.Mode
 		}
 		if uf.origExists {
-			mf.SHA256 = shortHash(uf.orig)
+			mf.SHA256 = sha256Hex(uf.orig)
 			mf.Local = filepath.Join(t.local, "files", uf.user, "authorized_keys")
 		}
 		m.Files = append(m.Files, mf)
@@ -849,7 +1056,7 @@ func (t *T) finishMeta(outcome Outcome) {
 	}
 }
 
-func shortHash(b []byte) string {
+func sha256Hex(b []byte) string {
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
 }
@@ -867,4 +1074,13 @@ func ParseMeta(data []byte) (Meta, error) {
 		return Meta{}, fmt.Errorf("parse meta.json: %w", err)
 	}
 	return m, nil
+}
+
+// optionNote renders authorized_keys restrictions for the log, so an operator
+// can see that a key went in restricted rather than inferring it.
+func optionNote(options []string) string {
+	if len(options) == 0 {
+		return ""
+	}
+	return " [" + strings.Join(options, ",") + "]"
 }

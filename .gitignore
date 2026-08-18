@@ -2,3 +2,4 @@
 /dist/
 *.test
 .scratch-bin/
+.scratch/

@@ -369,3 +369,42 @@ func TestRotationNeverLeavesTheFileWithoutAWorkingKey(t *testing.T) {
 			len(f.Find(authkeys.Matcher{Key: newPub})), len(f.Find(authkeys.Matcher{Key: oldPub})))
 	}
 }
+
+// TestCleanSwapFailureIsNotReportedAsUnverifiedRevert: a swap that fails with
+// a definite non-zero exit never completed its rename, so the target is
+// untouched. Reporting that as "revert could NOT be verified" (exit 3) sends
+// an operator hunting for damage to a host nothing wrote to. Found on a live
+// host: root editing a file in a directory its owner cannot write.
+func TestCleanSwapFailureIsNotReportedAsUnverifiedRevert(t *testing.T) {
+	h := newHarness(t)
+	guardSigner, _, guardLine := newKey(t)
+	_, newPub, _ := newKey(t)
+	if err := h.srv.WriteKeys(h.user, guardLine); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(h.srv.KeysPath(h.user))
+
+	// Make the directory unwritable so mktemp fails cleanly (exit != 0).
+	dir := filepath.Dir(h.srv.KeysPath(h.user))
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	cfg := h.config(guardSigner, []Op{
+		{User: h.user, Action: ActionAdd, Spec: "new", Matcher: authkeys.Matcher{Key: newPub}, Key: newPub},
+	})
+	res := Run(cfg)
+
+	if res.Outcome == OutcomeCommitted {
+		t.Fatalf("an unwritable directory must fail the transaction")
+	}
+	if res.Outcome == OutcomeRevertUnverified {
+		t.Errorf("reported %s for a file the failed swap never touched — "+
+			"a clean non-zero exit means the rename did not happen", res.Outcome)
+	}
+	after, _ := os.ReadFile(h.srv.KeysPath(h.user))
+	if !bytes.Equal(before, after) {
+		t.Errorf("file changed despite the swap failing")
+	}
+}

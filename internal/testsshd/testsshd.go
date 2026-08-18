@@ -25,6 +25,24 @@ type Server struct {
 	Addr    string // 127.0.0.1:port
 	Sandbox string // sandbox root; per-user keys at <Sandbox>/keys/<user>/authorized_keys
 
+	// StrictModes mirrors sshd's StrictModes (default yes in OpenSSH):
+	// an authorized_keys file writable by group or other is refused
+	// outright, whatever it contains. Without this the harness accepts a
+	// mode-0777 file that real sshd would reject, which is how a
+	// symlink-clobbering swap can pass a test suite and lock out a host.
+	StrictModes bool
+
+	// DenyUsers are refused at authentication regardless of their
+	// authorized_keys — sshd's AllowUsers/DenyUsers/locked-account shape.
+	// A rejection probe cannot distinguish this from "the key is gone".
+	DenyUsers map[string]bool
+
+	// DropExitStatusFor, when it returns true for a command, lets that
+	// command RUN and then closes the channel WITHOUT sending an
+	// exit-status message. x/crypto surfaces that as *ssh.ExitMissingError:
+	// the remote mutation landed but the client cannot know it did.
+	DropExitStatusFor func(rawCommand string) bool
+
 	ln  net.Listener
 	srv *glssh.Server
 	wg  sync.WaitGroup
@@ -59,7 +77,13 @@ func Start(sandbox string, hostSigner ssh.Signer) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{Addr: ln.Addr().String(), Sandbox: sandbox, ln: ln}
+	s := &Server{
+		Addr:        ln.Addr().String(),
+		Sandbox:     sandbox,
+		ln:          ln,
+		StrictModes: true,
+		DenyUsers:   map[string]bool{},
+	}
 
 	s.srv = &glssh.Server{
 		Handler: func(sess glssh.Session) {
@@ -96,10 +120,28 @@ func Start(sandbox string, hostSigner ssh.Signer) (*Server, error) {
 			} else if err != nil {
 				code = 1
 			}
+			if s.DropExitStatusFor != nil && s.DropExitStatusFor(raw) {
+				// Command ran; tear the channel down without an exit-status
+				// message. (Returning normally is not enough — the library
+				// then sends exit-status 0 on our behalf.)
+				_ = sess.Close()
+				return
+			}
 			_ = sess.Exit(code)
 		},
 		PublicKeyHandler: func(ctx glssh.Context, key glssh.PublicKey) bool {
-			content, err := os.ReadFile(s.KeysPath(ctx.User()))
+			if s.DenyUsers[ctx.User()] {
+				return false
+			}
+			p := s.KeysPath(ctx.User())
+			if s.StrictModes {
+				// sshd refuses a group/other-writable authorized_keys.
+				fi, err := os.Stat(p)
+				if err != nil || fi.Mode().Perm()&0o022 != 0 {
+					return false
+				}
+			}
+			content, err := os.ReadFile(p)
 			if err != nil {
 				return false
 			}

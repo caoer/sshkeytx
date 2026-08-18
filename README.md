@@ -7,15 +7,19 @@ Rotating or revoking SSH keys by editing `authorized_keys` has a canonical failu
 sshkeytx does exactly that. Every run is one transaction:
 
 1. **connect** — open a guard connection and hold it for the whole transaction; arm a dead-man trap on the remote before anything is touched
-2. **remove keys** — copy-and-swap: the file is backed up to **two locations** (remote transaction dir + local disk), then atomically replaced
-3. **verify removal** — a **fresh connection** with each removed key must be *rejected*, and a key that *is* still in the file must be *accepted*, so the rejection means something
-4. **add keys** — copy-and-swap again
-5. **verify addition** — a **fresh connection** with each added key must be *accepted*
+2. **add keys** — copy-and-swap: the file is backed up to **two locations** (remote transaction dir + local disk), then atomically replaced
+3. **verify addition** — a **fresh connection** with each added key must be *accepted*
+4. **remove keys** — copy-and-swap again
+5. **verify removal** — a **fresh connection** with each removed key must be *rejected*, and a key that *is* still in the file must be *accepted*, so the rejection means something
 6. **cleanup** — prove on a fresh connection that a key in the final file still works, then disarm the trap, remove the remote transaction dir, release the guard; local backups are kept
+
+Additions come first on purpose: a rotation is never one failure away from a host with no usable key, because the replacement is in place and proven before the old key goes. The end state is the same either way — the window is not.
 
 Any failure at any step aborts the transaction: every touched file is reverted to its pre-transaction content and the revert is verified byte-for-byte. If the process or the connection dies instead, the remote trap performs the same revert on its own.
 
-Multiple keys and multiple users fold into the same single transaction.
+Multiple keys and multiple users fold into the same single transaction. Adding
+and removing the *same* key for the *same* user is refused: the end state would
+depend on which step ran last. The same key for different users is fine.
 
 ## Install
 
@@ -99,12 +103,14 @@ sequenceDiagram
     participant S as sshd (fresh connections)
     L->>G: 1. connect, arm trap (dead-man revert)
     L->>L: backup to local disk
-    L->>G: 2. backup to remote tx dir, swap file (remove)
-    L->>S: 3. fresh connection with removed key
-    S-->>L: rejected ✓ (else: abort + revert)
-    L->>G: 4. backup, swap file (add)
-    L->>S: 5. fresh connection with added key
+    L->>G: 2. backup to remote tx dir, swap file (add)
+    L->>S: 3. fresh connection with added key
     S-->>L: accepted ✓ (else: abort + revert)
+    L->>G: 4. backup, swap file (remove)
+    L->>S: 5. fresh connection with removed key
+    S-->>L: rejected ✓ (else: abort + revert)
+    L->>S: 6. fresh connection with a key that remains
+    S-->>L: accepted ✓ — access proven, safe to let go
     L->>G: 6. commit marker, cleanup, release guard
 ```
 

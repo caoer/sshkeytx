@@ -248,7 +248,7 @@ func TestRejectionProbeNeedsPositiveControl(t *testing.T) {
 	cfg.Log = func(format string, args ...any) {
 		msg := fmt.Sprintf(format, args...)
 		h.t.Log(msg)
-		if strings.Contains(msg, "step 2/6 remove") {
+		if strings.Contains(msg, "step 4/6 remove") {
 			h.srv.DenyUsers[h.user] = true
 		}
 	}
@@ -278,5 +278,94 @@ func TestAddPreservesAuthorizedKeysOptions(t *testing.T) {
 
 	if !strings.Contains(got, "command=") || !strings.Contains(got, "restrict") {
 		t.Errorf("authorized_keys options were dropped — a restricted key installs unrestricted\ngot: %s", got)
+	}
+}
+
+// TestAddAndRemoveSameKeyIsRefused: adding and removing the same key for the
+// same user has no single correct meaning — whichever phase runs last decides
+// the end state, so the request would leave the key present under one phase
+// order and absent under another, with both verification steps "passing" and
+// contradicting each other.
+func TestAddAndRemoveSameKeyIsRefused(t *testing.T) {
+	h := newHarness(t)
+	guardSigner, _, guardLine := newKey(t)
+	_, churnPub, _ := newKey(t)
+	if err := h.srv.WriteKeys(h.user, guardLine); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := h.config(guardSigner, []Op{
+		{User: h.user, Action: ActionAdd, Spec: "k.pub", Matcher: authkeys.Matcher{Key: churnPub}, Key: churnPub},
+		{User: h.user, Action: ActionRemove, Spec: "k.pub", Matcher: authkeys.Matcher{Key: churnPub}, Key: churnPub},
+	})
+	res := Run(cfg)
+	if res.Outcome != OutcomeNothingChanged {
+		t.Fatalf("want refusal before any write, got %s (err=%v)", res.Outcome, res.Err)
+	}
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "both added") {
+		t.Errorf("want a self-cancelling-ops error, got %v", res.Err)
+	}
+
+	// By fingerprint rather than key material — same conflict.
+	cfg2 := h.config(guardSigner, []Op{
+		{User: h.user, Action: ActionAdd, Spec: "k.pub", Matcher: authkeys.Matcher{Key: churnPub}, Key: churnPub},
+		{User: h.user, Action: ActionRemove, Spec: "fp", Matcher: authkeys.Matcher{FingerprintSHA256: authkeys.Fingerprint(churnPub)}},
+	})
+	if res2 := Run(cfg2); res2.Outcome != OutcomeNothingChanged {
+		t.Errorf("fingerprint form: want refusal, got %s", res2.Outcome)
+	}
+
+	// The same key for DIFFERENT users is legitimate and must still be allowed.
+	cfg3 := h.config(guardSigner, []Op{
+		{User: h.user, Action: ActionAdd, Spec: "k.pub", Matcher: authkeys.Matcher{Key: churnPub}, Key: churnPub},
+		{User: "daemon", Action: ActionRemove, Spec: "k.pub", Matcher: authkeys.Matcher{Key: churnPub}, Key: churnPub},
+	})
+	if err := (&T{cfg: cfg3}).rejectSelfCancellingOps(); err != nil {
+		t.Errorf("same key for two different users must be allowed, got: %v", err)
+	}
+}
+
+// TestRotationNeverLeavesTheFileWithoutAWorkingKey pins what the phase order
+// buys: during a rotation of the ONLY key, every intermediate state of the
+// file on disk still contains a key sshd would accept. With removal first the
+// file passes through a state with no usable key, held open only by the guard
+// connection.
+func TestRotationNeverLeavesTheFileWithoutAWorkingKey(t *testing.T) {
+	h := newHarness(t)
+	oldSigner, oldPub, oldLine := newKey(t)
+	newSigner, newPub, _ := newKey(t)
+	if err := h.srv.WriteKeys(h.user, oldLine); err != nil {
+		t.Fatal(err)
+	}
+	keysPath := h.srv.KeysPath(h.user)
+
+	// Sample the file after every remote command the transaction issues.
+	var mu sync.Mutex
+	empty := 0
+	h.srv.DropExitStatusFor = func(string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if content, err := os.ReadFile(keysPath); err == nil && countKeys(authkeys.Parse(content)) == 0 {
+			empty++
+		}
+		return false
+	}
+
+	cfg := h.config(oldSigner, []Op{
+		{User: h.user, Action: ActionAdd, Spec: "new", Matcher: authkeys.Matcher{Key: newPub}, Key: newPub},
+		{User: h.user, Action: ActionRemove, Spec: "old", Matcher: authkeys.Matcher{FingerprintSHA256: authkeys.Fingerprint(oldPub)}},
+	})
+	cfg.VerifySigners = []ssh.Signer{newSigner}
+	res := Run(cfg)
+	if res.Err != nil || res.Outcome != OutcomeCommitted {
+		t.Fatalf("rotation should commit, got %s err=%v", res.Outcome, res.Err)
+	}
+	if empty > 0 {
+		t.Errorf("authorized_keys was observed with zero keys %d time(s) during the rotation", empty)
+	}
+	f := mustReadKeys(t, keysPath)
+	if len(f.Find(authkeys.Matcher{Key: newPub})) != 1 || len(f.Find(authkeys.Matcher{Key: oldPub})) != 0 {
+		t.Errorf("final state wrong: new present=%d old present=%d",
+			len(f.Find(authkeys.Matcher{Key: newPub})), len(f.Find(authkeys.Matcher{Key: oldPub})))
 	}
 }

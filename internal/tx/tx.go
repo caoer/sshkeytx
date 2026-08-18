@@ -1,11 +1,11 @@
 // Package tx implements the sshkeytx transaction:
 //
 //  1. connect     — open the guard connection, arm the remote dead-man trap
-//  2. remove keys — CAS: copy authorized_keys to remote + local backup, swap
-//  3. verify      — fresh connection with each removed key must be REJECTED,
+//  2. add keys    — CAS: copy authorized_keys to remote + local backup, swap
+//  3. verify      — fresh connection with each added key must be ACCEPTED
+//  4. remove keys — CAS again, swap
+//  5. verify      — fresh connection with each removed key must be REJECTED,
 //     after a positive control proves the probe can say ACCEPTED
-//  4. add keys    — CAS again, swap
-//  5. verify      — fresh connection with each added key must be ACCEPTED
 //  6. cleanup     — prove access, commit marker, tx dir removed, guard released
 //
 // The guard connection from step 1 is held for the whole transaction and
@@ -14,6 +14,11 @@
 // reverting every touched file to its pre-transaction content; if the
 // process or connection dies instead, the remote trap performs the same
 // revert.
+//
+// Additions come first on purpose: a rotation is then never one failure away
+// from a host with no usable key, because the replacement is in place and
+// proven before the old key goes. Removing first bought nothing — the removal
+// is verified at the end either way.
 //
 // Two rules keep the verdicts honest. A rejection is evidence only once some
 // key that IS in the file comes back accepted for the same user — otherwise
@@ -219,17 +224,19 @@ func Run(cfg Config) Result {
 		return Result{Outcome: OutcomeDryRun, TxID: t.txid, LocalDir: t.local}
 	}
 
-	// Steps 2–5.
-	if err := t.phaseRemove(); err != nil {
-		return t.abort(err)
-	}
-	if err := t.phaseVerifyRemoved(); err != nil {
-		return t.abort(err)
-	}
+	// Steps 2–5. Additions land and are proven BEFORE anything is removed,
+	// so the host never passes through a state with no key the operator can
+	// use. The end state is identical either way; the window is not.
 	if err := t.phaseAdd(); err != nil {
 		return t.abort(err)
 	}
 	if err := t.phaseVerifyAdded(); err != nil {
+		return t.abort(err)
+	}
+	if err := t.phaseRemove(); err != nil {
+		return t.abort(err)
+	}
+	if err := t.phaseVerifyRemoved(); err != nil {
 		return t.abort(err)
 	}
 
@@ -257,6 +264,34 @@ func (t *T) validate() error {
 		}
 		if op.Action == ActionAdd && op.Key == nil {
 			return fmt.Errorf("add for %s: spec %q must be a full public key (a fingerprint cannot be added)", op.User, op.Spec)
+		}
+	}
+	return t.rejectSelfCancellingOps()
+}
+
+// rejectSelfCancellingOps refuses a transaction that both adds and removes the
+// same key for the same user.
+//
+// Such a request has no single correct meaning: whichever phase runs last
+// decides the end state, so the same command leaves the key present under one
+// phase order and absent under another, while both verification steps "pass"
+// and contradict each other. The same key for DIFFERENT users is an ordinary
+// request (grant to alice, revoke from bob) and stays allowed.
+func (t *T) rejectSelfCancellingOps() error {
+	for _, add := range t.cfg.Ops {
+		if add.Action != ActionAdd || add.Key == nil {
+			continue
+		}
+		for _, rm := range t.cfg.Ops {
+			if rm.Action != ActionRemove || rm.User != add.User {
+				continue
+			}
+			if !rm.Matcher.Matches(authkeys.Line{Key: add.Key}) {
+				continue
+			}
+			return fmt.Errorf("refusing: %s is both added (%q) and removed (%q) for %s — "+
+				"the end state would depend on which step ran last; use separate transactions "+
+				"if you really mean to churn this key", authkeys.Fingerprint(add.Key), add.Spec, rm.Spec, add.User)
 		}
 	}
 	return nil
@@ -550,7 +585,7 @@ func (t *T) swap(uf *userFile) error {
 func (t *T) phaseRemove() error {
 	removals := t.opsBy(ActionRemove)
 	if len(removals) == 0 {
-		t.logf("step 2/6 remove: no removals requested — skipped")
+		t.logf("step 4/6 remove: no removals requested — skipped")
 		return nil
 	}
 	if err := t.checkHealth("pre-remove"); err != nil {
@@ -567,7 +602,7 @@ func (t *T) phaseRemove() error {
 			op := ops[i]
 			removed := uf.work.Remove(op.Matcher)
 			if len(removed) == 0 {
-				t.logf("step 2/6 remove: %s: %s already absent (idempotent, nothing to do)", u, op.Matcher)
+				t.logf("step 4/6 remove: %s: %s already absent (idempotent, nothing to do)", u, op.Matcher)
 				continue
 			}
 			// Keep the full key for the rejection probe even when the spec
@@ -577,7 +612,7 @@ func (t *T) phaseRemove() error {
 				ops[i] = op
 			}
 			changed = true
-			t.logf("step 2/6 remove: %s: removing %d line(s) matching %s", u, len(removed), op.Matcher)
+			t.logf("step 4/6 remove: %s: removing %d line(s) matching %s", u, len(removed), op.Matcher)
 		}
 		if !changed {
 			continue
@@ -588,7 +623,7 @@ func (t *T) phaseRemove() error {
 		if err := t.swap(uf); err != nil {
 			return err
 		}
-		t.logf("step 2/6 remove: %s swapped (%d keys remain)", uf.path, countKeys(uf.work))
+		t.logf("step 4/6 remove: %s swapped (%d keys remain)", uf.path, countKeys(uf.work))
 	}
 	// write back updated ops (Key enrichment) — opsBy returned copies
 	t.enrichRemovalKeys(removals)
@@ -623,7 +658,7 @@ func (t *T) phaseVerifyRemoved() error {
 		}
 	}
 	if !any {
-		t.logf("step 3/6 verify-removed: no removals — skipped")
+		t.logf("step 5/6 verify-removed: no removals — skipped")
 		return nil
 	}
 	if err := t.checkHealth("pre-verify-removed"); err != nil {
@@ -641,7 +676,7 @@ func (t *T) phaseVerifyRemoved() error {
 		controlled[op.User] = true
 		remaining := liveKeys(t.files[op.User].work)
 		if len(remaining) == 0 {
-			t.logf("step 3/6 verify-removed: %s: no keys remain, so no positive control is "+
+			t.logf("step 5/6 verify-removed: %s: no keys remain, so no positive control is "+
 				"possible — rejection verdicts below are UNVERIFIED until access is proven before commit", op.User)
 			continue
 		}
@@ -655,7 +690,7 @@ func (t *T) phaseVerifyRemoved() error {
 				"(sshd may refuse this user outright, or read a different AuthorizedKeysFile)",
 				op.User, len(remaining), t.files[op.User].path)
 		}
-		t.logf("step 3/6 verify-removed: %s: positive control ok — the probe channel answers ACCEPTED for a key that is present", op.User)
+		t.logf("step 5/6 verify-removed: %s: positive control ok — the probe channel answers ACCEPTED for a key that is present", op.User)
 	}
 
 	for _, op := range ops {
@@ -668,7 +703,7 @@ func (t *T) phaseVerifyRemoved() error {
 			if len(t.files[op.User].work.Find(op.Matcher)) > 0 {
 				return fmt.Errorf("verify-removed: %s still present in %s", op.Matcher, t.files[op.User].path)
 			}
-			t.logf("step 3/6 verify-removed: %s@%s: %s — content-verified absent (no key material for a live probe)", op.User, t.cfg.Target.Host, op.Matcher)
+			t.logf("step 5/6 verify-removed: %s@%s: %s — content-verified absent (no key material for a live probe)", op.User, t.cfg.Target.Host, op.Matcher)
 			continue
 		}
 		res, err := sshx.ProbeKey(target, op.Key, t.cfg.HostKey, t.cfg.DialTimeout)
@@ -678,7 +713,7 @@ func (t *T) phaseVerifyRemoved() error {
 		if res.Accepted {
 			return fmt.Errorf("verify-removed: %s STILL ACCEPTED for %s — %s", op.Matcher, target, res.Detail)
 		}
-		t.logf("step 3/6 verify-removed: %s: new connection REJECTED ✓ (%s)", op.Matcher, res.Detail)
+		t.logf("step 5/6 verify-removed: %s: new connection REJECTED ✓ (%s)", op.Matcher, res.Detail)
 	}
 	return nil
 }
@@ -687,7 +722,7 @@ func (t *T) phaseVerifyRemoved() error {
 func (t *T) phaseAdd() error {
 	adds := t.opsBy(ActionAdd)
 	if len(adds) == 0 {
-		t.logf("step 4/6 add: no additions requested — skipped")
+		t.logf("step 2/6 add: no additions requested — skipped")
 		return nil
 	}
 	if err := t.checkHealth("pre-add"); err != nil {
@@ -707,9 +742,9 @@ func (t *T) phaseAdd() error {
 		for _, op := range ops {
 			if uf.work.Add(op.Key, op.Comment, op.Options) {
 				changed = true
-				t.logf("step 4/6 add: %s: adding %s %s%s", u, op.Key.Type(), authkeys.Fingerprint(op.Key), optionNote(op.Options))
+				t.logf("step 2/6 add: %s: adding %s %s%s", u, op.Key.Type(), authkeys.Fingerprint(op.Key), optionNote(op.Options))
 			} else {
-				t.logf("step 4/6 add: %s: %s already present (idempotent, nothing to do)", u, authkeys.Fingerprint(op.Key))
+				t.logf("step 2/6 add: %s: %s already present (idempotent, nothing to do)", u, authkeys.Fingerprint(op.Key))
 			}
 		}
 		if !changed {
@@ -718,7 +753,7 @@ func (t *T) phaseAdd() error {
 		if err := t.swap(uf); err != nil {
 			return err
 		}
-		t.logf("step 4/6 add: %s swapped (%d keys now)", uf.path, countKeys(uf.work))
+		t.logf("step 2/6 add: %s swapped (%d keys now)", uf.path, countKeys(uf.work))
 	}
 	return nil
 }
@@ -734,7 +769,7 @@ func (t *T) phaseVerifyAdded() error {
 		}
 	}
 	if !any {
-		t.logf("step 5/6 verify-added: no additions — skipped")
+		t.logf("step 3/6 verify-added: no additions — skipped")
 		return nil
 	}
 	if err := t.checkHealth("pre-verify-added"); err != nil {
@@ -754,7 +789,7 @@ func (t *T) phaseVerifyAdded() error {
 			if !res.Accepted {
 				return fmt.Errorf("verify-added: %s NOT accepted for %s — %s", fp, target, res.Detail)
 			}
-			t.logf("step 5/6 verify-added: %s: new connection ACCEPTED ✓ (full auth)", fp)
+			t.logf("step 3/6 verify-added: %s: new connection ACCEPTED ✓ (full auth)", fp)
 			continue
 		}
 		res, err := sshx.ProbeKey(target, op.Key, t.cfg.HostKey, t.cfg.DialTimeout)
@@ -764,7 +799,7 @@ func (t *T) phaseVerifyAdded() error {
 		if !res.Accepted {
 			return fmt.Errorf("verify-added: %s NOT accepted for %s — %s", fp, target, res.Detail)
 		}
-		t.logf("step 5/6 verify-added: %s: new connection ACCEPTED ✓ (%s; supply --verify-identity for full auth)", fp, res.Detail)
+		t.logf("step 3/6 verify-added: %s: new connection ACCEPTED ✓ (%s; supply --verify-identity for full auth)", fp, res.Detail)
 	}
 	return nil
 }

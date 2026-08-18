@@ -1,0 +1,4 @@
+/sshkeytx
+/dist/
+*.test
+.scratch-bin/

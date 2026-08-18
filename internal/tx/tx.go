@@ -39,6 +39,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -575,7 +576,18 @@ func (t *T) swap(uf *userFile) error {
 	// issued", which is the only thing the client actually knows.
 	uf.dirty = true
 	if err := remote.SwapFile(t.client, uf.path, uf.work.Render(), t.writeOpts(uf)); err != nil {
-		uf.writeUnconfirmed = true
+		// A clean non-zero exit is a definite answer from the remote shell.
+		// The script ends `... && mv -f "$t" target || { rm -f "$t"; exit 1; }`,
+		// so the rename did not complete and the target is untouched — say so,
+		// rather than reporting an unverified revert for a file nothing wrote.
+		// Anything else (lost exit status, timeout) leaves the outcome unknown,
+		// and unknown must be treated as written.
+		var exitErr *remote.ExitError
+		if errors.As(err, &exitErr) {
+			uf.dirty = false
+		} else {
+			uf.writeUnconfirmed = true
+		}
 		return fmt.Errorf("swap %s: %w", uf.path, err)
 	}
 	return nil

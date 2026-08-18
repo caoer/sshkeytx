@@ -8,10 +8,10 @@ sshkeytx does exactly that. Every run is one transaction:
 
 1. **connect** — open a guard connection and hold it for the whole transaction; arm a dead-man trap on the remote before anything is touched
 2. **remove keys** — copy-and-swap: the file is backed up to **two locations** (remote transaction dir + local disk), then atomically replaced
-3. **verify removal** — a **fresh connection** with each removed key must be *rejected*
+3. **verify removal** — a **fresh connection** with each removed key must be *rejected*, and a key that *is* still in the file must be *accepted*, so the rejection means something
 4. **add keys** — copy-and-swap again
 5. **verify addition** — a **fresh connection** with each added key must be *accepted*
-6. **cleanup** — disarm the trap, remove the remote transaction dir, release the guard; local backups are kept
+6. **cleanup** — prove on a fresh connection that a key in the final file still works, then disarm the trap, remove the remote transaction dir, release the guard; local backups are kept
 
 Any failure at any step aborts the transaction: every touched file is reverted to its pre-transaction content and the revert is verified byte-for-byte. If the process or the connection dies instead, the remote trap performs the same revert on its own.
 
@@ -74,8 +74,13 @@ sshkeytx apply --target root@host --remove root=./old.pub --add root=./new.pub -
 Break-glass: re-apply the local pre-transaction backups from an earlier run:
 
 ```sh
+sshkeytx restore --target root@host --from ~/.local/state/sshkeytx/20260818T190412Z-ab12cd34 --dry-run
 sshkeytx restore --target root@host --from ~/.local/state/sshkeytx/20260818T190412Z-ab12cd34
 ```
+
+`restore` refuses a backup taken from a different host unless you pass
+`--force-different-host`; use `--dry-run` first, since it removes files that
+did not exist before that transaction.
 
 Key arguments are `user=KEY` where `KEY` is a `.pub` file path, a literal `ssh-ed25519 AAAA...` line, or a `SHA256:...` fingerprint (fingerprints can match for removal/audit, but cannot be added or probed — only real key material can).
 
@@ -106,6 +111,10 @@ sequenceDiagram
 - **The guard connection is the safety line.** It authenticates once, before anything changes, and every remote command of the transaction runs through it — a broken connection can never be papered over by a silent reconnect. Connection health is re-checked before every phase.
 - **The remote trap is the dead-man switch.** A held session runs a POSIX `sh` trap armed *before* the first write: if the session ends without a commit marker — process crash, connection drop, sshd shutdown — it restores every manifested file from its remote backup copy. Restores are content-overwrites (`cat backup > target`), preserving inode, owner, and mode.
 - **Copy-and-swap, two copies.** Before a file is first modified, its pre-transaction content is saved locally (`~/.local/state/sshkeytx/<txid>/`, kept forever) and remotely (transaction dir, feeding the trap). Writes are sibling-tempfile + `mv` — atomic on the same filesystem — with owner and mode preserved.
+- **A rejection is only evidence with a positive control.** sshd refuses some users outright — `AllowUsers`, `DenyUsers`, a locked account, `PermitRootLogin no` — and then every probe comes back rejected whatever the file contains. Before trusting a rejection, sshkeytx probes a key that *is* still in the file and requires an acceptance. If it cannot get one, it says so instead of claiming the key was revoked.
+- **Nothing commits until access is proven.** Before the trap is disarmed, a key in the final file must be accepted on a fresh connection. `--remove` of the last key fails the transaction rather than verifying you out of your own host.
+- **Symlinked `authorized_keys` is refused.** `stat` does not follow symlinks, so a link's own mode (0777 on Linux) would be copied onto the regular file that replaced it, and sshd `StrictModes` would then refuse every key in it. Point `--path` at the real file.
+- **Other users' files are written as those users.** When the guard is root and the file belongs to someone else, the write drops to that user (`runuser`, falling back to `su`), so a symlink planted in a home directory cannot redirect a privileged write. Temp files are created with `mktemp`, never a predictable name.
 - **Verification is live, not a file diff.** Removed keys are checked with the SSH publickey *query* phase (RFC 4252 §7): the probe offers the public key and the server answers whether it is authorized **before any signature is required** — so a revoked key is proven rejected even when its private half belongs to someone else. Added keys verify the same way, or by full authentication when you hold the private key (`--verify-identity`, or automatically when it's in your ssh-agent).
 - **Aborts revert and verify the revert.** Explicit revert first, read back and compared byte-for-byte (exit 1). If the connection is too dead to revert explicitly, the guard is dropped *without* the commit marker so the remote trap reverts server-side (exit 3, with backup paths printed).
 
@@ -126,7 +135,10 @@ Honest ones:
 - **Per-host transaction.** There is no two-phase commit across a fleet; run one transaction per host and let your orchestration handle the loop. Within a host, any mix of users and keys is one transaction.
 - **The dead-man trap fires when sshd reaps the session.** On process death or a closed TCP connection that is immediate; on a silent network partition it waits for the server's TCP/keepalive timeouts. The primary revert path is always the explicit one.
 - **Editing other users' files needs root** (or write permission on their files). The guard user is the `--target` user.
-- **Remote needs POSIX `sh`** on the exec path (bash, dash, ash, zsh all qualify; a root shell of fish does not).
+- **Remote needs POSIX `sh`** on the exec path (bash, dash, ash, zsh all qualify; a root shell of fish does not). Editing another user's file additionally needs `runuser` or `su` present.
+- **The trap is a shell trap.** It survives connection loss, a crash of sshkeytx, and sshd shutdown. It does not survive `kill -9` of the remote shell, a host reboot, or a `/tmp` wipe — put `--remote-tmp` somewhere durable if that matters to you.
+- **`PK_OK` is authorization, not login.** The query probe proves sshd would accept the key; PAM account rules, `ForceCommand` and multi-factor stacks are evaluated later. Pass `--verify-identity` for a full authentication when you hold the private key.
+- **Verification generates failed auth attempts.** One per removed key, from your IP. On a host running fail2ban or sshguard, a multi-key revocation can trip the jail — allowlist yourself first.
 - **NixOS-style managed hosts:** if `authorized_keys` is generated by configuration management, a rebuild will revert whatever sshkeytx changed. Point sshkeytx at the mutable path sshd actually consults, or feed your generator instead.
 
 ## Development

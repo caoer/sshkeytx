@@ -37,8 +37,8 @@ func ParseTarget(s string) (Target, error) {
 	return t, nil
 }
 
-func (t Target) Addr() string    { return net.JoinHostPort(t.Host, t.Port) }
-func (t Target) String() string  { return fmt.Sprintf("%s@%s", t.User, t.Addr()) }
+func (t Target) Addr() string             { return net.JoinHostPort(t.Host, t.Port) }
+func (t Target) String() string           { return fmt.Sprintf("%s@%s", t.User, t.Addr()) }
 func (t Target) WithUser(u string) Target { t2 := t; t2.User = u; return t2 }
 
 // HostKeyPolicy builds the ssh.HostKeyCallback for every connection the

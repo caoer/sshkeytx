@@ -71,7 +71,27 @@ type guard struct {
 	mu      sync.Mutex
 	exited  bool
 	exitErr error
-	stderr  bytes.Buffer
+	stderr  syncBuf
+}
+
+// syncBuf is a bytes.Buffer safe for the ssh library's stderr-copy goroutine
+// to write while startGuard's failure paths read it. Those reads happen while
+// the copier is still live; only closeGraceful's read is ordered after Wait.
+type syncBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }
 
 // startGuard opens the guard session on client and blocks until the remote

@@ -126,36 +126,43 @@ func (f *File) Remove(m Matcher) []Line {
 	return removed
 }
 
-// Add appends an authorized_keys line for key (with optional comment) unless
-// a line with the same key material already exists. Returns true if added.
-func (f *File) Add(key ssh.PublicKey, comment string) bool {
+// Add appends an authorized_keys line for key unless a line with the same key
+// material already exists. Returns true if added.
+//
+// options are the leading restrictions (command=, restrict, from=, no-pty…).
+// They are part of the grant: dropping them turns a forced-command key into a
+// shell key, so they are rendered back exactly as parsed.
+func (f *File) Add(key ssh.PublicKey, comment string, options []string) bool {
 	if len(f.Find(Matcher{Key: key})) > 0 {
 		return false
 	}
 	raw := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
+	if len(options) > 0 {
+		raw = strings.Join(options, ",") + " " + raw
+	}
 	if comment != "" {
 		raw += " " + comment
 	}
 	f.noFinalNewline = false
-	f.Lines = append(f.Lines, Line{Raw: raw, Key: key, Comment: comment})
+	f.Lines = append(f.Lines, Line{Raw: raw, Key: key, Comment: comment, Options: options})
 	return true
 }
 
 // ParseKeySpec turns a CLI key argument into a Matcher. Accepted forms:
 // a SHA256:... fingerprint, a literal "type base64 [comment]" public key
 // line, or raw file content of a .pub file. Literal/file forms also return
-// the parsed key and its comment.
-func ParseKeySpec(spec string) (Matcher, string, error) {
+// the parsed key, its comment, and any leading authorized_keys options.
+func ParseKeySpec(spec string) (Matcher, string, []string, error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
-		return Matcher{}, "", fmt.Errorf("empty key spec")
+		return Matcher{}, "", nil, fmt.Errorf("empty key spec")
 	}
 	if strings.HasPrefix(spec, "SHA256:") {
-		return Matcher{FingerprintSHA256: spec}, "", nil
+		return Matcher{FingerprintSHA256: spec}, "", nil, nil
 	}
-	key, comment, _, _, err := ssh.ParseAuthorizedKey([]byte(spec))
+	key, comment, options, _, err := ssh.ParseAuthorizedKey([]byte(spec))
 	if err != nil {
-		return Matcher{}, "", fmt.Errorf("key spec is neither a SHA256: fingerprint nor a public key line: %w", err)
+		return Matcher{}, "", nil, fmt.Errorf("key spec is neither a SHA256: fingerprint nor a public key line: %w", err)
 	}
-	return Matcher{Key: key}, comment, nil
+	return Matcher{Key: key}, comment, options, nil
 }

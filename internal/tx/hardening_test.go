@@ -2,9 +2,11 @@ package tx
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"golang.org/x/crypto/ssh"
@@ -178,8 +180,23 @@ func TestLostExitStatusDoesNotDisarmTrap(t *testing.T) {
 	if err := h.srv.WriteKeys(h.user, guardLine); err != nil {
 		t.Fatal(err)
 	}
-	// Lose the exit status of the swap only — the mv still happens.
-	h.srv.DropExitStatusFor = func(raw string) bool { return strings.Contains(raw, "mv -f") }
+	// Lose the exit status of the FIRST swap only. The mv still happens, so
+	// the file really changes; the abort's own revert is left working, which
+	// keeps the scenario deterministic.
+	var mu sync.Mutex
+	firstSwap := true
+	h.srv.DropExitStatusFor = func(raw string) bool {
+		if !strings.Contains(raw, "mv -f") {
+			return false
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if firstSwap {
+			firstSwap = false
+			return true
+		}
+		return false
+	}
 
 	cfg := h.config(guardSigner, []Op{
 		{User: h.user, Action: ActionAdd, Spec: "new", Matcher: authkeys.Matcher{Key: newPub}, Key: newPub},
@@ -189,22 +206,23 @@ func TestLostExitStatusDoesNotDisarmTrap(t *testing.T) {
 	if res.Outcome == OutcomeCommitted {
 		t.Fatalf("expected the lost exit status to fail the transaction, got committed")
 	}
+	// The mutation landed on the remote. Whatever the tool reports, it must
+	// not leave the added key in place: either its own revert removed it, or
+	// it left the trap armed and said the revert was unverified.
+	f := mustReadKeys(t, h.srv.KeysPath(h.user))
+	if len(f.Find(authkeys.Matcher{Key: newPub})) == 0 {
+		return // reverted despite never learning the swap succeeded
+	}
+	if res.Outcome == OutcomeAbortedReverted {
+		t.Errorf("reported %s (revert verified) but the remote file still carries the added key", res.Outcome)
+	}
 	entries, _ := os.ReadDir(filepath.Join(h.sandbox, "tmp"))
 	if len(entries) != 1 {
 		t.Fatalf("expected the tx dir to be kept, got %v", entries)
 	}
 	txdir := filepath.Join(h.sandbox, "tmp", entries[0].Name())
-
-	// The file really was mutated on the remote.
-	f := mustReadKeys(t, h.srv.KeysPath(h.user))
-	mutated := len(f.Find(authkeys.Matcher{Key: newPub})) > 0
-
-	if _, err := os.Stat(filepath.Join(txdir, "commit")); err == nil && mutated {
-		t.Errorf("abort disarmed the trap (wrote %s/commit) while the file is still mutated — "+
-			"nothing will restore it, and the outcome was reported as %s", txdir, res.Outcome)
-	}
-	if mutated && res.Outcome == OutcomeAbortedReverted {
-		t.Errorf("reported %s (revert verified) but the remote file still carries the added key", res.Outcome)
+	if _, err := os.Stat(filepath.Join(txdir, "commit")); err == nil {
+		t.Errorf("abort disarmed the trap (wrote %s/commit) while the file is still mutated — nothing will restore it", txdir)
 	}
 }
 
@@ -228,8 +246,9 @@ func TestRejectionProbeNeedsPositiveControl(t *testing.T) {
 	// transaction reaches its verification phase — otherwise the test would
 	// pass merely because the guard could not connect.
 	cfg.Log = func(format string, args ...any) {
-		h.t.Logf(format, args...)
-		if strings.Contains(format, "step 2/6 remove") {
+		msg := fmt.Sprintf(format, args...)
+		h.t.Log(msg)
+		if strings.Contains(msg, "step 2/6 remove") {
 			h.srv.DenyUsers[h.user] = true
 		}
 	}
@@ -249,12 +268,12 @@ func TestAddPreservesAuthorizedKeysOptions(t *testing.T) {
 	line := `command="/usr/bin/rrsync -ro /srv",restrict,no-pty ` +
 		strings.TrimSpace(string(ssh.MarshalAuthorizedKey(pub))) + " backup@nas"
 
-	m, comment, err := authkeys.ParseKeySpec(line)
+	m, comment, options, err := authkeys.ParseKeySpec(line)
 	if err != nil {
 		t.Fatal(err)
 	}
 	f := authkeys.Parse(nil)
-	f.Add(m.Key, comment)
+	f.Add(m.Key, comment, options)
 	got := string(f.Render())
 
 	if !strings.Contains(got, "command=") || !strings.Contains(got, "restrict") {

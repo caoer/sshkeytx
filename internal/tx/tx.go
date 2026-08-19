@@ -730,7 +730,10 @@ func (t *T) phaseVerifyRemoved() error {
 			t.logf("step 5/6 verify-removed: %s@%s: %s — content-verified absent (no key material for a live probe)", op.User, t.cfg.Target.Host, op.Matcher)
 			continue
 		}
-		res, err := sshx.ProbeKey(target, op.Key, t.cfg.HostKey, t.cfg.DialTimeout)
+		op := op
+		res, err := t.probeVerdict("step 5/6 verify-removed "+op.User, func() (sshx.ProbeResult, error) {
+			return sshx.ProbeKey(target, op.Key, t.cfg.HostKey, t.cfg.DialTimeout)
+		})
 		if err != nil {
 			return fmt.Errorf("verify-removed: %w", err)
 		}
@@ -805,8 +808,11 @@ func (t *T) phaseVerifyAdded() error {
 		}
 		target := t.cfg.Target.WithUser(op.User)
 		fp := authkeys.Fingerprint(op.Key)
+		op := op
 		if signer := matchSigner(t.cfg.VerifySigners, op.Key); signer != nil {
-			res, err := sshx.VerifyAuth(target, signer, t.cfg.HostKey, t.cfg.DialTimeout)
+			res, err := t.probeVerdict("step 3/6 verify-added "+op.User, func() (sshx.ProbeResult, error) {
+				return sshx.VerifyAuth(target, signer, t.cfg.HostKey, t.cfg.DialTimeout)
+			})
 			if err != nil {
 				return fmt.Errorf("verify-added: %w", err)
 			}
@@ -816,7 +822,9 @@ func (t *T) phaseVerifyAdded() error {
 			t.logf("step 3/6 verify-added: %s: new connection ACCEPTED ✓ (full auth)", fp)
 			continue
 		}
-		res, err := sshx.ProbeKey(target, op.Key, t.cfg.HostKey, t.cfg.DialTimeout)
+		res, err := t.probeVerdict("step 3/6 verify-added "+op.User, func() (sshx.ProbeResult, error) {
+			return sshx.ProbeKey(target, op.Key, t.cfg.HostKey, t.cfg.DialTimeout)
+		})
 		if err != nil {
 			return fmt.Errorf("verify-added: %w", err)
 		}
@@ -849,6 +857,40 @@ func liveKeys(f *authkeys.File) []ssh.PublicKey {
 	return out
 }
 
+// Fresh-connection probes are counted by sshd as FAILED authentications —
+// every ProbeKey aborts at the signature (positive controls included), and
+// OpenSSH 9.8+ ships PerSourcePenalties by default (authfail:5s, min:15s).
+// Four step-5 probes therefore buy the tool's own source address a ~20s
+// window in which the host accepts TCP and instantly closes — exactly the
+// "connection-level error, not an auth verdict" the probe layer reports.
+// Aborting on that reverts a verified rotation because the host briefly
+// stopped answering the phone; instead every probe verdict gets
+// probeAttempts tries, penaltyBackoff apart. A host that is genuinely gone
+// still fails, minutes not hours later, and the guard + dead-man trap stay
+// armed the whole time. (Observed live: macross-dev, NixOS OpenSSH 9.9,
+// penalty "19.719 seconds" after the two-user rotation's four probes.)
+var (
+	probeAttempts  = 3
+	penaltyBackoff = 20 * time.Second
+)
+
+// probeVerdict runs one fresh-connection probe to a verdict, waiting out
+// per-source penalty windows: retry only on connection-level errors — an
+// auth verdict (accepted OR rejected) returns immediately.
+func (t *T) probeVerdict(what string, fn func() (sshx.ProbeResult, error)) (sshx.ProbeResult, error) {
+	var res sshx.ProbeResult
+	var err error
+	for attempt := 1; ; attempt++ {
+		res, err = fn()
+		if err == nil || attempt >= probeAttempts {
+			return res, err
+		}
+		t.logf("%s: no verdict (attempt %d/%d): %v — waiting %s in case the probing source is inside a per-source penalty window (OpenSSH PerSourcePenalties)",
+			what, attempt, probeAttempts, err, penaltyBackoff)
+		time.Sleep(penaltyBackoff)
+	}
+}
+
 // someKeyAccepted probes keys for user on FRESH connections until one is
 // accepted. A connection-level error is returned as an error (it is not a
 // verdict); an all-rejected result is a false verdict, not a failure.
@@ -856,7 +898,10 @@ func (t *T) someKeyAccepted(user string, keys []ssh.PublicKey) (bool, error) {
 	target := t.cfg.Target.WithUser(user)
 	var lastErr error
 	for _, k := range keys {
-		res, err := sshx.ProbeKey(target, k, t.cfg.HostKey, t.cfg.DialTimeout)
+		k := k
+		res, err := t.probeVerdict("probe "+user, func() (sshx.ProbeResult, error) {
+			return sshx.ProbeKey(target, k, t.cfg.HostKey, t.cfg.DialTimeout)
+		})
 		if err != nil {
 			lastErr = err
 			continue

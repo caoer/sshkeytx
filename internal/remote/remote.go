@@ -291,3 +291,97 @@ func dirOf(path string) string {
 	}
 	return path[:i]
 }
+
+// DirOf is dirOf for callers outside this package, which need to stat a
+// target's parent directory to decide how to write it (see DecideWriteOpts).
+func DirOf(path string) string { return dirOf(path) }
+
+// dirWritableByOthers reports whether an octal mode grants write to group or
+// other. A directory anyone but root can write into is a directory root must
+// not write into on someone's behalf, sticky bit or not: the sticky bit stops
+// unlinking OTHER people's files, and every file this tool writes is created
+// under a name it chose itself in that same directory.
+func dirWritableByOthers(mode string) bool {
+	if len(mode) < 3 {
+		return true // unparseable — assume the unsafe answer
+	}
+	last := mode[len(mode)-3:]
+	group, other := last[1], last[2]
+	if group < '0' || group > '7' || other < '0' || other > '7' {
+		return true
+	}
+	return (group-'0')&2 != 0 || (other-'0')&2 != 0
+}
+
+// WriteTarget is everything DecideWriteOpts needs to judge one write.
+type WriteTarget struct {
+	GuardIsRoot bool     // the guard connection's uid is 0
+	GuardUser   string   // the user the guard authenticated as
+	EntryUser   string   // the authorized_keys entry's owner-to-be
+	EntryUID    string   // EntryUser's numeric uid
+	EntryGID    string   // EntryUser's numeric gid
+	File        FileInfo // the target file, pre-transaction
+	Dir         FileInfo // the target's PARENT DIRECTORY
+}
+
+// DecideWriteOpts is the single place that decides whether a privileged write
+// drops privileges. Both `apply` (tx.writeOpts) and `restore` route through it,
+// because they diverged once and the recovery half was the broken one.
+//
+// THE PREDICATE IS THE PARENT DIRECTORY, NOT THE FILE.
+//
+// The drop exists for one reason (see the package doc): root must not write
+// into a directory its owner controls, because that owner can arrange for the
+// write to land somewhere else. That is a property of the DIRECTORY. Keying it
+// on the file's owner — as 355ed68 did on the username, and as the first fix
+// did on the file's uid — gets the common cases right and the interesting ones
+// wrong in both directions:
+//
+//   - root-owned file in a user-owned home (an admin's `sudo cp`, or any
+//     config-management tool that forgot to chown) took the ROOT path, which
+//     is the escalation the drop was written to prevent;
+//   - root-owned file in a root-owned directory (NixOS renders
+//     /etc/ssh/authorized_keys.d/<user> as root:root 444) took the DROP path,
+//     where mktemp cannot succeed, so neither the edit nor the revert could
+//     ever land.
+//
+// Directory ownership answers both at once, and it answers the absent-file
+// case too — which the file's own ownership cannot, there being no file to
+// stat. So this function needs no special case for creation.
+func DecideWriteOpts(t WriteTarget) WriteOpts {
+	opts := WriteOpts{}
+	if t.File.Exists {
+		opts.Mode = t.File.Mode
+	} else {
+		opts.Mode = "600"
+		opts.MkdirFor = true
+	}
+
+	// A non-root guard can neither drop nor chown; it writes as itself.
+	if !t.GuardIsRoot {
+		return opts
+	}
+
+	// Writing the guard's own file: nobody to drop to.
+	if t.EntryUser != t.GuardUser {
+		// A directory root owns and only root can write is a directory the
+		// entry user could never have written to — dropping there guarantees
+		// EACCES. Anywhere else, the entry user may control the directory, so
+		// the write happens with their own credentials and reaches nothing
+		// they could not already reach.
+		rootManaged := t.Dir.Exists && t.Dir.UID == "0" && !dirWritableByOthers(t.Dir.Mode)
+		if !rootManaged {
+			opts.RunAs = t.EntryUser
+			return opts
+		}
+	}
+
+	// Root writes it. Preserve the file's ownership if it had one; a file
+	// being created belongs to the entry user.
+	if t.File.Exists {
+		opts.UID, opts.GID = t.File.UID, t.File.GID
+	} else {
+		opts.UID, opts.GID = t.EntryUID, t.EntryGID
+	}
+	return opts
+}

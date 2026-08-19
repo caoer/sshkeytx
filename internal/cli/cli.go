@@ -510,14 +510,39 @@ func restoreCmd(rf *rootFlags) *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("local backup for %s: %w", f.User, err)
 				}
-				// MkdirFor is deliberately not set: restore re-applies files
-				// that existed before, so their directories exist too, and
-				// creating one here would chmod a directory that may be shared
-				// (--path /etc/ssh/authorized_keys.d/%u).
-				opts := remote.WriteOpts{Mode: f.Mode}
-				if uid == "0" {
-					opts.RunAs = f.User
+				// Same decision as `apply`, through the same function. This
+				// used to be an inline `if uid == "0" { opts.RunAs = f.User }`
+				// — the pre-2026-08-19 rule — which meant restore could not
+				// land on exactly the root-owned, root-directory files that
+				// apply had just learned to write: mktemp as the entry user in
+				// a directory they cannot write is EACCES, and this is the
+				// path reached when the host is ALREADY broken.
+				//
+				// Dir is statted live rather than taken from meta.json: a
+				// directory's ownership is what governs the write NOW, and the
+				// break-glass path must not trust a file on disk for it.
+				dirInfo, err := remote.Stat(client, remote.DirOf(f.Path))
+				if err != nil {
+					return exitError{ExitPreflight, fmt.Errorf("stat parent of %s: %w", f.Path, err)}
 				}
+				euid, egid, _, err := remote.LookupUser(client, f.User)
+				if err != nil {
+					return exitError{ExitPreflight, fmt.Errorf("resolve %s: %w", f.User, err)}
+				}
+				// MkdirFor stays unset: restore re-applies files that existed
+				// before, so their directories exist too, and creating one here
+				// would chmod a directory that may be shared
+				// (--path /etc/ssh/authorized_keys.d/%u).
+				opts := remote.DecideWriteOpts(remote.WriteTarget{
+					GuardIsRoot: uid == "0",
+					GuardUser:   target.User,
+					EntryUser:   f.User,
+					EntryUID:    euid,
+					EntryGID:    egid,
+					File:        remote.FileInfo{Exists: true, UID: f.UID, GID: f.GID, Mode: f.Mode},
+					Dir:         dirInfo,
+				})
+				opts.MkdirFor = false
 				if err := remote.SwapFile(client, f.Path, content, opts); err != nil {
 					return exitError{ExitPreflight, fmt.Errorf("restore %s: %w", f.Path, err)}
 				}

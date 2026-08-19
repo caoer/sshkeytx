@@ -27,10 +27,11 @@
 // final file is proven to work on a fresh connection, so a transaction cannot
 // verify its way into a lockout.
 //
-// Files belonging to another user are written with that user's own privileges
-// (remote.WriteOpts.RunAs) and symlinked targets are refused outright: a
-// privileged write into a directory its owner controls is the whole of the
-// escalation surface here.
+// A privileged write into a directory its owner controls is the whole of the
+// escalation surface here, so that is exactly what the write policy keys on:
+// remote.DecideWriteOpts drops to the entry user (remote.WriteOpts.RunAs)
+// unless the target's PARENT DIRECTORY is root-owned and writable by nobody
+// else. Symlinked targets and symlinked parents are refused outright.
 package tx
 
 import (
@@ -115,6 +116,7 @@ type userFile struct {
 	uid, gid   string
 	home       string
 	info       remote.FileInfo // pre-transaction
+	dirInfo    remote.FileInfo // the target's PARENT DIRECTORY — decides the privilege drop
 	orig       []byte          // pre-transaction content
 	origExists bool
 	work       *authkeys.File // working copy being edited
@@ -452,13 +454,20 @@ func (t *T) loadFiles() error {
 			return fmt.Errorf("%s is a symlink (%w) — point --path at the real file, "+
 				"or at the mutable path sshd consults", path, remote.ErrSymlink)
 		}
+		// The PARENT DIRECTORY decides whether the write drops privileges
+		// (remote.DecideWriteOpts). Statted here, once, alongside the file —
+		// and it is the only signal available at all when the file is absent.
+		dirInfo, err := remote.Stat(t.client, remote.DirOf(path))
+		if err != nil {
+			return fmt.Errorf("stat parent of %s: %w", path, err)
+		}
 		content, exists, err := remote.ReadFile(t.client, path)
 		if err != nil {
 			return err
 		}
 		uf := &userFile{
 			user: u, path: path, uid: uid, gid: gid, home: home,
-			info: info, orig: content, origExists: exists,
+			info: info, dirInfo: dirInfo, orig: content, origExists: exists,
 			work: authkeys.Parse(content),
 		}
 		t.files[u] = uf
@@ -543,42 +552,21 @@ func valueOr(s, alt string) string {
 
 // swap is the "swap" half: atomic replace with ownership/mode preserved
 // (or created 600, owner = target user, for new files).
-// writeOpts builds the attribute policy for a write to uf. When the guard is
-// root and the file belongs to someone else, the write drops to that user
-// rather than chowning afterwards — a privileged write into a directory its
-// owner controls is what made a planted symlink worth planting.
-//
-// OWNERSHIP, not the entry's username, decides the drop. Config-managed hosts
-// keep every user's file root-owned in a root-owned directory (NixOS renders
-// /etc/ssh/authorized_keys.d/<user> as root:root 444): dropping to the entry
-// user there makes mktemp fail EACCES in a directory that user was never able
-// to write, so no edit — and no REVERT (writeOpts also feeds the revert path)
-// — can ever land. Root rewriting a root-owned file in a root-owned directory
-// is the normal case the drop was never meant to forbid. The drop fires
-// exactly when the existing file is owned by the entry's own uid; a file that
-// does not exist yet has no owner, so the entry user — whose home the %h
-// template points into — remains the drop target for the create.
+// writeOpts builds the attribute policy for a write to uf. The decision itself
+// lives in remote.DecideWriteOpts, which `restore` also calls: the two used to
+// carry separate copies of this rule, they drifted, and the half that broke was
+// the break-glass one. writeOpts also feeds the REVERT path, so a decision that
+// cannot land here cannot be undone either.
 func (t *T) writeOpts(uf *userFile) remote.WriteOpts {
-	opts := remote.WriteOpts{}
-	if !uf.info.Exists {
-		opts.Mode = "600"
-		opts.MkdirFor = true
-		if t.rootly && uf.user != t.cfg.Target.User {
-			opts.RunAs = uf.user
-		} else if t.rootly {
-			opts.UID, opts.GID = uf.uid, uf.gid
-		}
-		return opts
-	}
-	opts.Mode = uf.info.Mode
-	if t.rootly && uf.user != t.cfg.Target.User && uf.info.UID == uf.uid {
-		opts.RunAs = uf.user
-		return opts
-	}
-	if t.rootly {
-		opts.UID, opts.GID = uf.info.UID, uf.info.GID
-	}
-	return opts
+	return remote.DecideWriteOpts(remote.WriteTarget{
+		GuardIsRoot: t.rootly,
+		GuardUser:   t.cfg.Target.User,
+		EntryUser:   uf.user,
+		EntryUID:    uf.uid,
+		EntryGID:    uf.gid,
+		File:        uf.info,
+		Dir:         uf.dirInfo,
+	})
 }
 
 func (t *T) swap(uf *userFile) error {
@@ -732,7 +720,7 @@ func (t *T) phaseVerifyRemoved() error {
 		}
 		op := op
 		res, err := t.probeVerdict("step 5/6 verify-removed "+op.User, func() (sshx.ProbeResult, error) {
-			return sshx.ProbeKey(target, op.Key, t.cfg.HostKey, t.cfg.DialTimeout)
+			return probeKey(target, op.Key, t.cfg.HostKey, t.cfg.DialTimeout)
 		})
 		if err != nil {
 			return fmt.Errorf("verify-removed: %w", err)
@@ -811,7 +799,7 @@ func (t *T) phaseVerifyAdded() error {
 		op := op
 		if signer := matchSigner(t.cfg.VerifySigners, op.Key); signer != nil {
 			res, err := t.probeVerdict("step 3/6 verify-added "+op.User, func() (sshx.ProbeResult, error) {
-				return sshx.VerifyAuth(target, signer, t.cfg.HostKey, t.cfg.DialTimeout)
+				return verifyAuth(target, signer, t.cfg.HostKey, t.cfg.DialTimeout)
 			})
 			if err != nil {
 				return fmt.Errorf("verify-added: %w", err)
@@ -823,7 +811,7 @@ func (t *T) phaseVerifyAdded() error {
 			continue
 		}
 		res, err := t.probeVerdict("step 3/6 verify-added "+op.User, func() (sshx.ProbeResult, error) {
-			return sshx.ProbeKey(target, op.Key, t.cfg.HostKey, t.cfg.DialTimeout)
+			return probeKey(target, op.Key, t.cfg.HostKey, t.cfg.DialTimeout)
 		})
 		if err != nil {
 			return fmt.Errorf("verify-added: %w", err)
@@ -874,6 +862,15 @@ var (
 	penaltyBackoff = 20 * time.Second
 )
 
+// Probe entry points, indirected so a test can reach the retry wiring THROUGH
+// the real phases. Without this seam the retry could be unhooked from every
+// call site and the whole suite would still pass — proberetry_test.go proved
+// the wrapper worked and nothing proved the phases used it.
+var (
+	probeKey   = sshx.ProbeKey
+	verifyAuth = sshx.VerifyAuth
+)
+
 // probeVerdict runs one fresh-connection probe to a verdict, waiting out
 // per-source penalty windows: retry only on connection-level errors — an
 // auth verdict (accepted OR rejected) returns immediately.
@@ -900,7 +897,7 @@ func (t *T) someKeyAccepted(user string, keys []ssh.PublicKey) (bool, error) {
 	for _, k := range keys {
 		k := k
 		res, err := t.probeVerdict("probe "+user, func() (sshx.ProbeResult, error) {
-			return sshx.ProbeKey(target, k, t.cfg.HostKey, t.cfg.DialTimeout)
+			return probeKey(target, k, t.cfg.HostKey, t.cfg.DialTimeout)
 		})
 		if err != nil {
 			lastErr = err

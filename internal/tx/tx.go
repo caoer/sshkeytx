@@ -547,24 +547,36 @@ func valueOr(s, alt string) string {
 // root and the file belongs to someone else, the write drops to that user
 // rather than chowning afterwards — a privileged write into a directory its
 // owner controls is what made a planted symlink worth planting.
+//
+// OWNERSHIP, not the entry's username, decides the drop. Config-managed hosts
+// keep every user's file root-owned in a root-owned directory (NixOS renders
+// /etc/ssh/authorized_keys.d/<user> as root:root 444): dropping to the entry
+// user there makes mktemp fail EACCES in a directory that user was never able
+// to write, so no edit — and no REVERT (writeOpts also feeds the revert path)
+// — can ever land. Root rewriting a root-owned file in a root-owned directory
+// is the normal case the drop was never meant to forbid. The drop fires
+// exactly when the existing file is owned by the entry's own uid; a file that
+// does not exist yet has no owner, so the entry user — whose home the %h
+// template points into — remains the drop target for the create.
 func (t *T) writeOpts(uf *userFile) remote.WriteOpts {
 	opts := remote.WriteOpts{}
-	if uf.info.Exists {
-		opts.Mode = uf.info.Mode
-	} else {
+	if !uf.info.Exists {
 		opts.Mode = "600"
 		opts.MkdirFor = true
+		if t.rootly && uf.user != t.cfg.Target.User {
+			opts.RunAs = uf.user
+		} else if t.rootly {
+			opts.UID, opts.GID = uf.uid, uf.gid
+		}
+		return opts
 	}
-	if t.rootly && uf.user != t.cfg.Target.User {
+	opts.Mode = uf.info.Mode
+	if t.rootly && uf.user != t.cfg.Target.User && uf.info.UID == uf.uid {
 		opts.RunAs = uf.user
 		return opts
 	}
 	if t.rootly {
-		if uf.info.Exists {
-			opts.UID, opts.GID = uf.info.UID, uf.info.GID
-		} else {
-			opts.UID, opts.GID = uf.uid, uf.gid
-		}
+		opts.UID, opts.GID = uf.info.UID, uf.info.GID
 	}
 	return opts
 }

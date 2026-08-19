@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -301,16 +302,52 @@ func DirOf(path string) string { return dirOf(path) }
 // not write into on someone's behalf, sticky bit or not: the sticky bit stops
 // unlinking OTHER people's files, and every file this tool writes is created
 // under a name it chose itself in that same directory.
+//
+// Parsed as a whole number, not by slicing the last three bytes: that sliced
+// form got 4-digit modes right by luck and short read-only modes ("44") wrong,
+// reporting them writable. Wrong in the safe direction, but it forced a drop
+// into a directory the entry user cannot write, i.e. a guaranteed EACCES.
+// Anything that does not parse is unsafe by definition.
 func dirWritableByOthers(mode string) bool {
-	if len(mode) < 3 {
-		return true // unparseable — assume the unsafe answer
-	}
-	last := mode[len(mode)-3:]
-	group, other := last[1], last[2]
-	if group < '0' || group > '7' || other < '0' || other > '7' {
+	v, err := strconv.ParseUint(mode, 8, 32)
+	if err != nil {
 		return true
 	}
-	return (group-'0')&2 != 0 || (other-'0')&2 != 0
+	return v&0o022 != 0
+}
+
+// ErrOwnershipHandover is returned by CheckWriteTarget for the one combination
+// that has no safe automatic answer: an existing file owned by somebody OTHER
+// than the entry user, inside a directory the entry user controls.
+//
+// Dropping to the entry user makes the mv land a file THEY created, so a
+// root-owned authorized_keys silently becomes theirs — permanently, with no
+// chown and no log line, and the transaction's own revert would not restore it
+// because abort() compares content and not ownership. Writing as root instead
+// puts a privileged write inside a directory its owner controls, which is the
+// escalation this whole predicate exists to prevent. Both answers are wrong,
+// so the tool refuses and says why. Root-owned keys in a user's home are a
+// deliberate pattern (the user must not be able to edit them); converting it to
+// self-service on the quiet is worse than stopping.
+var ErrOwnershipHandover = errors.New("existing file is owned by another user inside a directory the entry user controls")
+
+// CheckWriteTarget rejects targets DecideWriteOpts must not be asked to judge.
+// Call it before the decision; the decision itself has no error path so that
+// every caller shares one predicate.
+func CheckWriteTarget(t WriteTarget) error {
+	if !t.GuardIsRoot || t.EntryUser == t.GuardUser || !t.File.Exists {
+		return nil
+	}
+	rootManaged := t.Dir.Exists && t.Dir.UID == "0" && !dirWritableByOthers(t.Dir.Mode)
+	if rootManaged {
+		return nil
+	}
+	if t.File.UID != "" && t.File.UID != t.EntryUID {
+		return fmt.Errorf("%w: %s is owned by uid %s, not %s (uid %s), and its directory is not root-managed — "+
+			"chown it to %s, or point --path at a file in a root-owned directory",
+			ErrOwnershipHandover, t.EntryUser, t.File.UID, t.EntryUser, t.EntryUID, t.EntryUser)
+	}
+	return nil
 }
 
 // WriteTarget is everything DecideWriteOpts needs to judge one write.
@@ -348,6 +385,9 @@ type WriteTarget struct {
 // Directory ownership answers both at once, and it answers the absent-file
 // case too — which the file's own ownership cannot, there being no file to
 // stat. So this function needs no special case for creation.
+//
+// ErrOwnershipHandover names the one combination it refuses rather than
+// decides: see the check below.
 func DecideWriteOpts(t WriteTarget) WriteOpts {
 	opts := WriteOpts{}
 	if t.File.Exists {
@@ -364,6 +404,10 @@ func DecideWriteOpts(t WriteTarget) WriteOpts {
 
 	// Writing the guard's own file: nobody to drop to.
 	if t.EntryUser != t.GuardUser {
+		// One combination has no correct answer, so it is refused rather than
+		// guessed — see CheckWriteTarget, which callers must consult first.
+		// Dropping would silently hand the file to the entry user; writing as
+		// root would put a privileged write in a directory they control.
 		// A directory root owns and only root can write is a directory the
 		// entry user could never have written to — dropping there guarantees
 		// EACCES. Anywhere else, the entry user may control the directory, so

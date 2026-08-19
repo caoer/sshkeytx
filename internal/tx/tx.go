@@ -461,6 +461,22 @@ func (t *T) loadFiles() error {
 		if err != nil {
 			return fmt.Errorf("stat parent of %s: %w", path, err)
 		}
+		if dirInfo.IsSymlink {
+			// Same reasoning as the file check below, and refused in the same
+			// place: SwapFile would catch it, but only mid-transaction, after
+			// the guard is up, the backups are written and — in a multi-user
+			// transaction — other users' files have already been swapped and
+			// must now be reverted. A preflight refusal costs nothing.
+			return fmt.Errorf("parent directory of %s is a symlink (%w) — point --path at the real path",
+				path, remote.ErrSymlink)
+		}
+		if err := remote.CheckWriteTarget(remote.WriteTarget{
+			GuardIsRoot: t.rootly, GuardUser: t.cfg.Target.User,
+			EntryUser: u, EntryUID: uid, EntryGID: gid,
+			File: info, Dir: dirInfo,
+		}); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
 		content, exists, err := remote.ReadFile(t.client, path)
 		if err != nil {
 			return err

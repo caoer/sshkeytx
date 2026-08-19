@@ -44,9 +44,17 @@ func guardScript(txdir string) string {
 		`  [ -f "$TX/commit" ] && return 0`,
 		`  if [ -f "$TX/manifest" ]; then`,
 		`    while IFS='` + tab + `' read -r typ bak dst; do`,
+		// The trap restores as root, and `>` follows symlinks. SwapFile
+		// refuses a symlinked target and a symlinked parent; the trap did not,
+		// so a user who controls the directory could swap the target for a
+		// link mid-transaction and have root write the backup content through
+		// it. The two halves of one transaction must agree about who may write
+		// where. A refusal is recorded, never silent.
 		`      case "$typ" in`,
-		`        F) [ -f "$bak" ] && cat "$bak" > "$dst" ;;`,
-		`        A) rm -f "$dst" ;;`,
+		`        F) if [ -L "$dst" ] || [ -L "$(dirname "$dst")" ]; then`,
+		`             printf '%s\n' "$dst" >> "$TX/restore-refused"`,
+		`           elif [ -f "$bak" ]; then cat "$bak" > "$dst"; fi ;;`,
+		`        A) [ -L "$dst" ] && printf '%s\n' "$dst" >> "$TX/restore-refused" || rm -f "$dst" ;;`,
 		`      esac`,
 		`    done < "$TX/manifest"`,
 		`    : > "$TX/restored"`,

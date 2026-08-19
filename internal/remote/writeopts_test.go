@@ -1,6 +1,9 @@
 package remote
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 // TestDecideWriteOptsKeysOnDirectory pins the predicate that governs the
 // privilege drop: the PARENT DIRECTORY's ownership, not the file's and not the
@@ -60,7 +63,11 @@ func TestDecideWriteOptsKeysOnDirectory(t *testing.T) {
 			runAs: "alice", uid: "", gid: "", mode: "600",
 		},
 		{
-			// The regression the file-ownership rule introduced.
+			// The regression the file-ownership rule introduced. NOTE: callers
+			// never reach this decision — CheckWriteTarget refuses the
+			// combination outright (TestCheckWriteTargetRefusesOwnershipHandover),
+			// because dropping here silently hands the file to alice. The case
+			// stays to pin what the raw decision is if that guard is removed.
 			name: "user-owned dir, ROOT-owned file (admin's sudo cp): DROP, not a root write",
 			tgt: WriteTarget{GuardIsRoot: true, GuardUser: "root", EntryUser: "alice",
 				EntryUID: aliceUID, EntryGID: aliceGID,
@@ -156,8 +163,10 @@ func TestDecideWriteOptsKeysOnDirectory(t *testing.T) {
 }
 
 func TestDirWritableByOthers(t *testing.T) {
-	safe := []string{"755", "700", "0755", "555", "0500"}
-	unsafe := []string{"775", "757", "777", "1777", "0770", "707", "", "x"}
+	// Boundaries the sliced-last-three-bytes version got wrong: setuid/setgid
+	// prefixes, and short read-only modes it reported as writable.
+	safe := []string{"755", "700", "0755", "555", "0500", "2755", "4755", "44", "0", "4", "5", "55"}
+	unsafe := []string{"775", "757", "777", "1777", "0770", "707", "7", "70", "", "x", "-755", "08"}
 	for _, m := range safe {
 		if dirWritableByOthers(m) {
 			t.Errorf("mode %q: want safe, got writable-by-others", m)
@@ -167,5 +176,53 @@ func TestDirWritableByOthers(t *testing.T) {
 		if !dirWritableByOthers(m) {
 			t.Errorf("mode %q: want writable-by-others (unparseable counts), got safe", m)
 		}
+	}
+}
+
+// TestCheckWriteTargetRefusesOwnershipHandover pins the one combination that
+// has no safe automatic answer: an existing file owned by somebody other than
+// the entry user, in a directory the entry user controls.
+//
+// DecideWriteOpts would return RunAs=<entry user>, and the mv then lands a file
+// THEY created — a root-owned authorized_keys silently becomes theirs, with no
+// chown and no log line, and abort()'s revert would not notice because it
+// compares content only. Writing as root instead is the escalation the whole
+// predicate exists to prevent. Both answers are wrong, so the caller refuses.
+func TestCheckWriteTargetRefusesOwnershipHandover(t *testing.T) {
+	userDir := FileInfo{Exists: true, UID: "1000", GID: "100", Mode: "700"}
+	rootDir := FileInfo{Exists: true, UID: "0", GID: "0", Mode: "755"}
+	base := func(f, d FileInfo) WriteTarget {
+		return WriteTarget{GuardIsRoot: true, GuardUser: "root", EntryUser: "alice",
+			EntryUID: "1000", EntryGID: "100", File: f, Dir: d}
+	}
+	rootOwned := FileInfo{Exists: true, UID: "0", GID: "0", Mode: "600"}
+	aliceOwned := FileInfo{Exists: true, UID: "1000", GID: "100", Mode: "600"}
+
+	if err := CheckWriteTarget(base(rootOwned, userDir)); !errors.Is(err, ErrOwnershipHandover) {
+		t.Errorf("root-owned file in alice's dir: want ErrOwnershipHandover, got %v", err)
+	}
+	// Same file, root-managed directory: root writes it, nothing is handed over.
+	if err := CheckWriteTarget(base(rootOwned, rootDir)); err != nil {
+		t.Errorf("root-owned file in a root-owned dir: want no error, got %v", err)
+	}
+	// Alice's own file in her own directory is the ordinary drop.
+	if err := CheckWriteTarget(base(aliceOwned, userDir)); err != nil {
+		t.Errorf("alice's file in alice's dir: want no error, got %v", err)
+	}
+	// Nothing exists yet: no ownership to hand over.
+	if err := CheckWriteTarget(base(FileInfo{Exists: false}, userDir)); err != nil {
+		t.Errorf("absent file: want no error, got %v", err)
+	}
+	// A non-root guard cannot hand anything over; it writes as itself or fails.
+	nonRoot := base(rootOwned, userDir)
+	nonRoot.GuardIsRoot = false
+	if err := CheckWriteTarget(nonRoot); err != nil {
+		t.Errorf("non-root guard: want no error, got %v", err)
+	}
+	// The guard's own file is never a handover.
+	own := base(rootOwned, userDir)
+	own.EntryUser = "root"
+	if err := CheckWriteTarget(own); err != nil {
+		t.Errorf("guard's own file: want no error, got %v", err)
 	}
 }

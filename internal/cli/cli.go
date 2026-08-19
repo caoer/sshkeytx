@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -470,6 +471,17 @@ func restoreCmd(rf *rootFlags) *cobra.Command {
 				if !strings.HasPrefix(f.Path, "/") {
 					return fmt.Errorf("meta.json names a non-absolute path %q — refusing this backup", f.Path)
 				}
+				// Absolute was the ONLY constraint, so meta.json could name any
+				// path and restore would write attacker-chosen content there as
+				// root — /etc/sudoers.d/x, /etc/ld.so.preload — with the
+				// `existed:false` branch below as the matching root `rm -f`.
+				// Restore may only touch the two shapes a transaction produces:
+				// %h/.ssh/authorized_keys and <dir>/authorized_keys.d/<user>.
+				base := path.Base(f.Path)
+				parent := path.Base(path.Dir(f.Path))
+				if base != "authorized_keys" && !(parent == "authorized_keys.d" && base == f.User) {
+					return fmt.Errorf("meta.json names %q, which is not an authorized_keys path this tool writes — refusing this backup", f.Path)
+				}
 			}
 			if dryRun {
 				for _, f := range m.Files {
@@ -518,30 +530,42 @@ func restoreCmd(rf *rootFlags) *cobra.Command {
 				// a directory they cannot write is EACCES, and this is the
 				// path reached when the host is ALREADY broken.
 				//
-				// Dir is statted live rather than taken from meta.json: a
-				// directory's ownership is what governs the write NOW, and the
-				// break-glass path must not trust a file on disk for it.
+				// Everything the decision consumes is statted LIVE. meta.json
+				// is operator-supplied on this path and its own comment says so
+				// — taking the recorded uid/gid would have made restore an
+				// arbitrary-ownership chown primitive, which the pre-2026-08-19
+				// code was accidentally safe from only because it always
+				// dropped and therefore always EACCESed outside a home.
 				dirInfo, err := remote.Stat(client, remote.DirOf(f.Path))
 				if err != nil {
 					return exitError{ExitPreflight, fmt.Errorf("stat parent of %s: %w", f.Path, err)}
 				}
-				euid, egid, _, err := remote.LookupUser(client, f.User)
+				liveInfo, err := remote.Stat(client, f.Path)
 				if err != nil {
-					return exitError{ExitPreflight, fmt.Errorf("resolve %s: %w", f.User, err)}
+					return exitError{ExitPreflight, fmt.Errorf("stat %s: %w", f.Path, err)}
+				}
+				if liveInfo.IsSymlink || dirInfo.IsSymlink {
+					return exitError{ExitPreflight, fmt.Errorf("%s or its parent is a symlink (%w) — refusing", f.Path, remote.ErrSymlink)}
+				}
+				if !liveInfo.Exists {
+					liveInfo = remote.FileInfo{Exists: true, UID: "", GID: "", Mode: f.Mode}
+				}
+				tgt := remote.WriteTarget{
+					GuardIsRoot: uid == "0",
+					GuardUser:   target.User,
+					EntryUser:   f.User,
+					File:        liveInfo,
+					Dir:         dirInfo,
+				}
+				if err := remote.CheckWriteTarget(tgt); err != nil {
+					return exitError{ExitPreflight, fmt.Errorf("%s: %w", f.Path, err)}
 				}
 				// MkdirFor stays unset: restore re-applies files that existed
 				// before, so their directories exist too, and creating one here
 				// would chmod a directory that may be shared
 				// (--path /etc/ssh/authorized_keys.d/%u).
-				opts := remote.DecideWriteOpts(remote.WriteTarget{
-					GuardIsRoot: uid == "0",
-					GuardUser:   target.User,
-					EntryUser:   f.User,
-					EntryUID:    euid,
-					EntryGID:    egid,
-					File:        remote.FileInfo{Exists: true, UID: f.UID, GID: f.GID, Mode: f.Mode},
-					Dir:         dirInfo,
-				})
+				opts := remote.DecideWriteOpts(tgt)
+				opts.Mode = f.Mode
 				opts.MkdirFor = false
 				if err := remote.SwapFile(client, f.Path, content, opts); err != nil {
 					return exitError{ExitPreflight, fmt.Errorf("restore %s: %w", f.Path, err)}
